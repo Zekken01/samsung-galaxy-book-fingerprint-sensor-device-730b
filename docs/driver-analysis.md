@@ -1,36 +1,40 @@
-# CanvasBio Fingerprint Driver 바이너리 분석 결과
+# Windows Driver Binary Analysis
 
-## 1. 드라이버 파일 구성
+Reverse engineering results from the CanvasBio fingerprint Windows driver binaries.
 
-### 04E8:730B 전용 드라이버 (v2.4.5.882, 2023-07-25)
+## 1. Driver Files
 
-| 파일 | 크기 | 용도 |
-|------|------|------|
-| `CanvasBioFingerprintDriver.dll` | 163KB | **UMDF 센서 드라이버** (USB 통신, 센서 제어) |
-| `CanvasBioFingerprintEngine.dll` | 677KB | **WinBio 엔진 어댑터** (지문 매칭, 템플릿 관리) |
-| `CanvasBioFingerprint.inf` | 5.5KB | 드라이버 설정 |
+### 04E8:730B Driver (v2.4.5.882, 2023-07-25)
 
-### 최신 VID_2DF0 드라이버 (v5.1.155.6134, 2024-10-09)
+| File | Size | Purpose |
+|------|------|---------|
+| `CanvasBioFingerprintDriver.dll` | 163KB | **UMDF sensor driver** (USB communication, sensor control) |
+| `CanvasBioFingerprintEngine.dll` | 677KB | **WinBio engine adapter** (fingerprint matching, template management) |
+| `CanvasBioFingerprint.inf` | 5.5KB | Driver INF configuration |
 
-| 파일 | 크기 | 용도 |
-|------|------|------|
-| `CanvasBioFingerprintDriver.dll` | 1MB | **UMDF MOC 드라이버** (Realtek 기반) |
-| `CanvasBioFingerprintAdapter.dll` | 489KB | **WinBio 통합 어댑터** (Sensor+Engine+Storage) |
+### Newer VID_2DF0 Driver (v5.1.155.6134, 2024-10-09)
 
-> **중요**: 2DF0:0007 버전은 MOC(Match-on-Chip) + SDCP + TLS 사용.
-> 04E8:730B 버전은 **호스트 매칭** (SensorMode=1, Basic) — 더 단순한 프로토콜!
+| File | Size | Purpose |
+|------|------|---------|
+| `CanvasBioFingerprintDriver.dll` | 1MB | **UMDF MOC driver** (Realtek-based) |
+| `CanvasBioFingerprintAdapter.dll` | 489KB | **WinBio unified adapter** (Sensor+Engine+Storage) |
 
-## 2. 소프트웨어 아키텍처
+> **Important**: The VID 2DF0:0007 version uses MOC (Match-on-Chip) + SDCP + TLS.
+> The 04E8:730B version uses **host-side matching** (SensorMode=1, Basic) — a much simpler protocol.
 
-### 빌드 환경
+## 2. Software Architecture
+
+### Build Environment
+
 ```
-프로젝트 경로: C:\workspace\btp_sdk\WBF_UMDF2_TEST\umdf2_fx2\driver\
-PDB 경로:      ...\x64\Release\osrusbfx2um\CanvasBioFingerprintDriver.pdb
-엔진 경로:     ...\adapters\engine_adapter\x64\Release\
-기반 프레임워크: Microsoft WDF UMDF 2.15 + osrusbfx2 (MS USB 샘플 기반!)
+Project path: C:\workspace\btp_sdk\WBF_UMDF2_TEST\umdf2_fx2\driver\
+PDB path:     ...\x64\Release\osrusbfx2um\CanvasBioFingerprintDriver.pdb
+Engine path:  ...\adapters\engine_adapter\x64\Release\
+Framework:    Microsoft WDF UMDF 2.15 + osrusbfx2 (based on MS USB sample!)
 ```
 
-### 계층 구조
+### Layer Diagram
+
 ```
 ┌─────────────────────────────────────────────┐
 │  Windows Biometric Framework (WBF/WinBio)   │
@@ -40,7 +44,7 @@ PDB 경로:      ...\x64\Release\osrusbfx2um\CanvasBioFingerprintDriver.pdb
 │  ├─ EngineAdapterCreateEnrollment()         │
 │  ├─ EngineAdapterIdentifyFeatureSet()       │
 │  ├─ ExtractRawImg() / ExtractInfoFromSample()│
-│  └─ 호스트 측 지문 매칭 (BCrypt 사용)       │
+│  └─ Host-side fingerprint matching (BCrypt) │
 ├─────────────────────────────────────────────┤
 │  CanvasBioFingerprintDriver.dll (UMDF)      │
 │  ├─ FxEvtDevicePrepareHardware()            │
@@ -60,7 +64,7 @@ PDB 경로:      ...\x64\Release\osrusbfx2um\CanvasBioFingerprintDriver.pdb
 │  │   ├─ SetMode(SENSOR_MODE_CAPTURE)        │
 │  │   ├─ CaptureImage[CB/IX]()              │
 │  │   └─ ReadImage()                         │
-│  └─ cfs_* (센서 SPI 통신 레이어)            │
+│  └─ cfs_* (sensor SPI communication layer)  │
 │      ├─ cfs_writeRegister(reg, val)         │
 │      ├─ cfs_write2ByteRegister(reg, val)    │
 │      ├─ cfs_writeRegisterEx(reg, data, len) │
@@ -68,140 +72,94 @@ PDB 경로:      ...\x64\Release\osrusbfx2um\CanvasBioFingerprintDriver.pdb
 │      └─ cfs_readImage()                     │
 ├─────────────────────────────────────────────┤
 │  WinUSB (NativeUSB UMDF Dispatcher)         │
-│  ├─ Bulk OUT (EP 0x01) → SPI 명령 전달      │
-│  ├─ Bulk IN  (EP 0x82) → SPI 응답 수신      │
-│  └─ Interrupt IN (EP 0x83) → IRQ 이벤트     │
+│  ├─ Bulk OUT (EP 0x01) → SPI commands       │
+│  ├─ Bulk IN  (EP 0x82) → SPI responses      │
+│  └─ Interrupt IN (EP 0x83) → IRQ events     │
 ├─────────────────────────────────────────────┤
 │  Cypress PSoC MCU ("CYUS")                  │
-│  ├─ USB ↔ SPI 브릿지                        │
-│  ├─ 벤더 Control Transfer 레지스터          │
-│  └─ IRQ 라우팅                              │
+│  ├─ USB ↔ SPI bridge                        │
+│  ├─ Vendor control transfer registers       │
+│  └─ IRQ routing                             │
 ├─────────────────────────────────────────────┤
-│  CanvasBio 센서 IC (CB2000)                 │
-│  ├─ SPI 레지스터 인터페이스                  │
-│  ├─ 이미지 캡처 (112x96 또는 80x64)         │
-│  ├─ ADC / SNR 설정                          │
-│  └─ IRQ (fingerdown 감지)                   │
+│  CanvasBio Sensor IC (CB2000)               │
+│  ├─ SPI register interface                  │
+│  ├─ Image capture (112x96 or 80x64)         │
+│  ├─ ADC / SNR configuration                 │
+│  └─ IRQ (finger-down detection)             │
 └─────────────────────────────────────────────┘
 ```
 
-## 3. USB 통신 프로토콜 (핵심!)
+## 3. Key Function Signatures (from Ghidra)
 
-### 3.1 Cypress MCU는 USB↔SPI 브릿지
+### SPI Communication Layer (`cfs_*`)
 
-Bulk 엔드포인트를 통해 **SPI 명령을 센서에 전달**하는 구조:
+```c
+// Write single-byte SPI register
+// Protocol: CA(0x0002, 3) → Bulk OUT [A9 reg val] → CC check
+void cfs_writeRegister(uint8_t reg, uint8_t val);
 
-```
-Host → Bulk OUT → Cypress MCU → SPI → CanvasBio Sensor
-Host ← Bulk IN  ← Cypress MCU ← SPI ← CanvasBio Sensor
-Host ← Int  IN  ← Cypress MCU ← IRQ ← CanvasBio Sensor
-```
+// Write two-byte SPI register
+// Protocol: CA(0x0002, 4) → Bulk OUT [A9 reg hi lo] → CC check
+void cfs_write2ByteRegister(uint8_t reg, uint16_t val);
 
-### 3.2 cfs_ 레이어 (SPI over USB Bulk)
+// Read SPI register
+// Protocol: CA(0x0003, 3) → Bulk OUT [A8 reg 00] → Bulk IN [00 00 val]
+uint8_t cfs_readRegister(uint8_t reg);
 
-핵심 통신 함수:
-- `cfs_writeRegister(reg, val)` — 센서 SPI 레지스터 쓰기
-- `cfs_write2ByteRegister(reg, val)` — 2바이트 레지스터 쓰기
-- `cfs_writeRegisterEx(reg, data, len)` — 확장 레지스터 쓰기
-- `cfs_readRegister(reg)` — 센서 SPI 레지스터 읽기
-- `cfs_readImage()` — 이미지 데이터 읽기
-
-### 3.3 센서 SPI 레지스터 (CB_ 접두사)
-
-발견된 레지스터:
-- `CB_REG_BIAS_SET` — 바이어스 전압 설정
-- `CB_REG_CELL_AMP_SET` — 셀 앰프 설정
-- `CB_CMD_SCAN` — 스캔 명령
-- `CB_MODE_CAPTURE` — 캡처 모드
-
-### 3.4 Bulk 패킷 구조 (추정)
-
-`cfs_writeRegister`가 USB Bulk를 통해 SPI 명령을 보내는 방식:
-
-```
-Bulk OUT 패킷 (추정):
-[CMD_TYPE: 1B] [REG_ADDR: 1B] [DATA: 1-2B]
-
-예: cfs_writeRegister(0x10, 0x01) → Bulk OUT: [WRITE_CMD] [0x10] [0x01]
-    cfs_readRegister(0x10)       → Bulk OUT: [READ_CMD] [0x10]
-                                   Bulk IN:  [0x10] [VALUE]
-    cfs_readImage()              → Bulk OUT: [READ_IMG_CMD]
-                                   Bulk IN:  [IMAGE_DATA...]
+// Read image data from sensor buffer
+// Protocol: CA(0x0003, 10755) → 42 bulk OUT/IN block pairs
+void cfs_readImage(uint8_t* buffer, size_t size);
 ```
 
-## 4. 초기화 시퀀스 (추정)
+### Sensor Control
 
-DLL의 함수 호출 순서로 추론:
+```c
+// Initialization sequence
+void PrepareHardwareForUSBDriver();
+void ConfigCypressPower();            // DB vendor writes
+void ReadHardwareID();                // SPI read reg 0xB9, logs "Hardware id : 0x%02x"
+void SoftResetSensor();
+void cb_power_on();
+void InitParam();                     // 17 register writes
+void SetFingerDownAdcValues();        // Regs 0x40, 0x41
 
-```
-1. PrepareHardwareForUSBDriver()
-   ├─ WinUSB 핸들 열기
-   ├─ Vendor_CheckPipe() — EP 확인
-   └─ ConfigCypressPower() — Cypress MCU 전원 설정
-      → Control Transfer 0xC0으로 레지스터 확인?
-
-2. Vendor_InitializeSensor()
-   ├─ ReadHardwareID() — 하드웨어 ID 확인
-   │   → "Hardware id : 0x%02x"
-   │   → "Hardware id mismatch" 시 에러
-   ├─ SoftResetSensor() — 소프트 리셋
-   ├─ cb_power_on() — 센서 전원 켜기
-   ├─ InitParam() — 파라미터 초기화
-   │   ├─ CB_SetSNRAdcValue() — SNR ADC 설정
-   │   ├─ SetAdcValue() — ADC 값 설정
-   │   └─ SetFingerDownAdcValues() — 손가락 감지 임계값
-   └─ InitializeWBF() — WBF 프레임워크 연결
-
-3. SetMode(SENSOR_MODE_FINGER_DOWN) — 손가락 대기 모드
-   └─ OnIrqSignal() — "occurred fingerdown irq"
-
-4. SetMode(SENSOR_MODE_CAPTURE) — 캡처 모드
-   └─ CaptureImageCB() / CaptureImageIX()
-      └─ cfs_readImage() → ReadImage()
+// Operating modes
+void SetMode(int mode);              // FINGER_DOWN or CAPTURE
+void WaitFingerDownCB();             // Poll register 0x20 for 0x0107
+void CaptureImageCB();              // 4-phase capture protocol
+void ReadImage();                    // Bulk image transfer
 ```
 
-## 5. 센서 사양
-
-| 항목 | 값 |
-|------|-----|
-| 센서 모델 | CanvasBio CB2000 |
-| 센서 타입 | Capacitive area sensor |
-| 해상도 변형 | 112×96 @ 340dpi 또는 80×64 @ 508dpi |
-| 센서 크기 (0xDD) | 100×20 (레지스터 보고) |
-| 통신 | SPI (USB-SPI 브릿지 via Cypress) |
-| 매칭 방식 | **호스트 매칭** (Basic SensorMode=1) |
-| 펌웨어 | v1.0.3, Build 2211 |
-
-## 6. 다음 단계: Linux 드라이버 개발
-
-### 6.1 Bulk 패킷 구조 확인 (Windows VM 캡처)
-
-**아직 필요한 핵심 정보:**
-1. `cfs_writeRegister()` → Bulk OUT 패킷 형식
-2. `cfs_readRegister()` → Bulk OUT/IN 패킷 형식
-3. `cfs_readImage()` → 이미지 전송 프로토콜
-4. 초기화 시퀀스의 정확한 레지스터 값
-
-### 6.2 Windows VM 캡처 시 집중할 것
+### Discovered String Literals
 
 ```
-캡처 시나리오:
-1. 드라이버 로드 → PrepareHardware → InitializeSensor 패킷
-2. 손가락 대기 → SetMode(FINGER_DOWN) → IRQ 패턴
-3. 이미지 캡처 → SetMode(CAPTURE) → ReadImage 데이터
+"CYUS"                               // Cypress MCU magic (reg 0xBD)
+"Hardware id : 0x%02x"               // ReadHardwareID() log
+"Hardware id mismatch"               // ID validation failure
+"occurred fingerdown irq"            // OnIrqSignal() log
 ```
 
-### 6.3 libfprint 드라이버 구조 (계획)
+## 4. Sensor Specifications
 
-```
-libfprint/drivers/canvasbio/
-├─ fpi-device-canvasbio.c    # 메인 드라이버
-├─ canvasbio.h               # 상수 정의
-├─ canvasbio-usb.c           # cfs_* USB-SPI 통신 레이어
-└─ canvasbio-sensor.c        # CB_ 센서 제어
-```
+| Property | Value |
+|----------|-------|
+| Sensor model | CanvasBio CB2000 |
+| Sensor type | Capacitive area sensor |
+| Resolution variants | 112x96 @ ~340dpi or 80x64 @ ~508dpi |
+| Sensor dimensions (reg 0xDD) | 100x20 (register-reported) |
+| Communication | SPI (via USB-SPI bridge) |
+| Matching mode | **Host-side matching** (Basic SensorMode=1) |
+| Firmware | v1.0.3, Build 2211 |
+| MCU magic | "CYUS" (Cypress USB System) |
 
-- USB-SPI 브릿지 프로토콜은 Cypress MCU 전용
-- 센서 레지스터는 SPI를 통해 접근
-- 이미지는 호스트에서 처리 (Basic 모드)
-- libfprint의 기존 이미지 처리 파이프라인 활용 가능
+## 5. Key Insights for Linux Driver Development
+
+1. **The Cypress MCU is just a bridge** — All sensor logic is accessed via SPI register read/write through bulk endpoints.
+
+2. **Host-side matching simplifies everything** — No need to implement TLS, SDCP, or on-chip template management. Just capture the image and process it on the host.
+
+3. **The init sequence is critical** — The sensor won't respond until the exact power-on and register configuration sequence is replicated.
+
+4. **Two capture variants exist** — `CaptureImageCB` (CanvasBio native) and `CaptureImageIX` (extended). The 04E8:730B device uses the CB variant.
+
+5. **Finger detection is SPI-based** — Despite having an interrupt endpoint (EP 0x83), the Windows driver polls SPI register 0x20 for finger-down detection, not the interrupt endpoint.
