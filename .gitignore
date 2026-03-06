@@ -1,0 +1,13 @@
+/target
+
+# Binary capture data (too large for git)
+captures/
+driver_analysis/
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp

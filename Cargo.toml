@@ -1,0 +1,25 @@
+[package]
+name = "canvasbio-fp"
+version = "0.1.0"
+edition = "2021"
+description = "Linux driver for CanvasBio CB2000 fingerprint sensor (Samsung Galaxy Book, USB 04e8:730b)"
+
+[[bin]]
+name = "canvasbio-fp"
+path = "src/main.rs"
+
+[[bin]]
+name = "analyze-capture"
+path = "src/bin/analyze_capture.rs"
+
+[[bin]]
+name = "extract-image"
+path = "src/bin/extract_image.rs"
+
+[dependencies]
+rusb = "0.9"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+log = "0.4"
+env_logger = "0.11"
