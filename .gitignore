@@ -4,6 +4,9 @@
 captures/
 driver_analysis/
 
+# libfprint TOD driver build
+libfprint-tod-canvasbio/build/
+
 # Claude Code
 .claude/
 

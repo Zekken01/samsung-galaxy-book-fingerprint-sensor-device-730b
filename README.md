@@ -16,15 +16,16 @@
 
 ## Status
 
-**Working.** The driver can initialize the sensor, detect finger placement, capture fingerprint images, and save them as PNG files. This was built entirely through reverse engineering with no official documentation.
+**Working.** Full fingerprint enrollment and verification via fprintd. This was built entirely through reverse engineering with no official documentation.
 
 | Feature | Status |
 |---------|--------|
 | Sensor initialization | Working |
 | Image capture (112x96 8bpp) | Working |
-| Finger-down detection | Working |
-| CLI tool | Working |
-| fprintd/libfprint integration | Planned |
+| Finger-down detection | Working (software, image variance) |
+| CLI tool (Rust) | Working |
+| libfprint TOD driver | **Working** (enroll + verify) |
+| fprintd integration | **Working** (fprintd-enroll / fprintd-verify) |
 
 ## Hardware
 
@@ -199,11 +200,39 @@ This driver was built without any official documentation. The entire protocol wa
 
 See [docs/driver-analysis.md](docs/driver-analysis.md) and [docs/research.md](docs/research.md) for detailed findings.
 
+## libfprint TOD Driver
+
+A C-based libfprint Touch OEM Driver (TOD) plugin lives in `libfprint-tod-canvasbio/`. It provides full fprintd integration:
+
+- **All USB I/O via raw ioctls** — `USBDEVFS_CONTROL` and `USBDEVFS_BULK` for maximum reliability with this device
+- **Software finger detection** — Image variance analysis (threshold > 100) distinguishes finger from blank sensor
+- **3x bilinear upscale** — 112x96 → 336x288 with bilinear interpolation for reliable NBIS minutiae extraction (64-98 minutiae per image)
+- **Automatic USB reset recovery** — Post-capture SPI state corruption handled via USB device reset cycle
+- **Debug image dumps** — Build with `meson setup build -Ddebug_images=true` to write raw PGM files to `/tmp/`
+
+### Building the TOD driver
+
+```bash
+cd libfprint-tod-canvasbio
+meson setup build
+ninja -C build
+sudo ninja -C build install
+sudo pkill -9 fprintd   # restart to load new driver
+```
+
+### Usage
+
+```bash
+fprintd-enroll           # Enroll a fingerprint (6 scans)
+fprintd-verify           # Verify against enrolled print
+sudo pam-auth-update --enable fprintd   # Enable for login/sudo
+```
+
 ## Known Limitations
 
-- **No fprintd integration yet** — Currently a standalone CLI tool. libfprint driver is planned.
-- **Last block 1 byte short** — Block 41 occasionally returns 255B instead of 256B; the missing pixel is zero-padded.
-- **Without finger** — Capture still works but produces a blank/dark image (scan timeout is non-fatal).
+- **Small sensor** — 112x96 resolution means matching scores vary with finger placement. bz3_threshold is tuned low (6) to compensate.
+- **USB reset between captures** — Post-capture SPI state corruption requires full USB device reset (~2s), limiting capture rate.
+- **Last block short** — Block 41 occasionally returns 255B instead of 256B; missing pixels are zero-padded.
 
 ## Device Recovery
 

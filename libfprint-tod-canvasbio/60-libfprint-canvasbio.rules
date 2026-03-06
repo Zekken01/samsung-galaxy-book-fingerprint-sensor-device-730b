@@ -1,0 +1,2 @@
+# CanvasBio CB2000 fingerprint sensor (Samsung Galaxy Book)
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="04e8", ATTRS{idProduct}=="730b", TAG+="uaccess"

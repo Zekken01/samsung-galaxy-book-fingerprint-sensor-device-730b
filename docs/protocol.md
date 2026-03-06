@@ -296,3 +296,15 @@ Phase 4 — Bulk Image Transfer:
 - **DPI**: ~340 (estimated from sensor physical dimensions)
 - **Orientation**: Top-to-bottom, left-to-right raster scan
 - **Buffer register**: 0x06 (image data read via `A8 06 00`)
+
+## 8. Image Processing
+
+The raw sensor output requires processing before fingerprint matching:
+
+1. **Raw image**: 112x96 @ 8-bit grayscale, white ridges on dark background
+2. **Color inversion**: `FPI_IMAGE_COLORS_INVERTED` flag tells NBIS to invert (expects dark ridges on light background)
+3. **3x bilinear upscale**: Image resized to 336x288 using bilinear interpolation. Critical for NBIS — without upscale, only 1-4 minutiae are extracted (insufficient for matching). With 3x bilinear: 64-98 minutiae.
+4. **ppmm**: 19.685 (500 DPI) — NBIS native resolution for optimal ridge spacing detection
+5. **bz3_threshold**: 6 — tuned low for the small 112x96 sensor area
+
+Note: Contrast stretching was found to *reduce* matching accuracy and is disabled.
