@@ -1,6 +1,7 @@
 #define FP_COMPONENT "canvasbio"
 
 #include <stdio.h>
+#include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -8,11 +9,138 @@
 #include <drivers_api.h>
 #include "canvasbio.h"
 
-/* Bilinear upscale: src (sw x sh) → dst (sw*scale x sh*scale).
- * Much better for NBIS than nearest-neighbor (no blocky artifacts). */
+/* CLAHE (Contrast Limited Adaptive Histogram Equalization).
+ * Divides image into tiles, computes clipped histograms per tile,
+ * then bilinear-interpolates CDF mappings to avoid block artifacts.
+ * Operates in-place on buf. */
 static void
-cb_bilinear_upscale (const guint8 *src, int sw, int sh,
-                     guint8 *dst, int scale)
+cb_clahe (guint8 *buf, int width, int height,
+          int tile_w, int tile_h, gdouble clip_limit)
+{
+  int nx = width / tile_w;   /* number of tiles horizontally */
+  int ny = height / tile_h;  /* number of tiles vertically */
+
+  if (nx < 1 || ny < 1)
+    return;
+
+  int tile_pixels = tile_w * tile_h;
+  int clip_count = (int)(clip_limit * tile_pixels / 256);
+  if (clip_count < 1)
+    clip_count = 1;
+
+  /* Allocate CDF LUTs for all tiles: nx * ny * 256 bytes */
+  guint8 *cdfs = g_malloc0 ((gsize) nx * ny * 256);
+
+  /* Build per-tile CDF */
+  for (int ty = 0; ty < ny; ty++)
+    {
+      for (int tx = 0; tx < nx; tx++)
+        {
+          int hist[256] = { 0 };
+          int y0 = ty * tile_h;
+          int x0 = tx * tile_w;
+
+          /* Compute histogram for this tile */
+          for (int y = y0; y < y0 + tile_h; y++)
+            for (int x = x0; x < x0 + tile_w; x++)
+              hist[buf[y * width + x]]++;
+
+          /* Clip histogram and redistribute excess */
+          int excess = 0;
+          for (int i = 0; i < 256; i++)
+            {
+              if (hist[i] > clip_count)
+                {
+                  excess += hist[i] - clip_count;
+                  hist[i] = clip_count;
+                }
+            }
+          int bonus = excess / 256;
+          int residual = excess - bonus * 256;
+          for (int i = 0; i < 256; i++)
+            hist[i] += bonus;
+          /* Spread residual evenly across bins */
+          for (int i = 0; i < residual; i++)
+            hist[(int)((gint64) i * 256 / residual)]++;
+
+          /* Compute CDF and normalize to 0-255 */
+          int cdf = 0;
+          guint8 *lut = cdfs + ((gsize) ty * nx + tx) * 256;
+          for (int i = 0; i < 256; i++)
+            {
+              cdf += hist[i];
+              lut[i] = (guint8) CLAMP ((int)((gdouble) cdf * 255 / tile_pixels + 0.5), 0, 255);
+            }
+        }
+    }
+
+  /* Apply CLAHE with bilinear interpolation between tile CDFs */
+  for (int y = 0; y < height; y++)
+    {
+      /* Map pixel to tile-center coordinates */
+      gdouble gy = ((gdouble) y - (gdouble) tile_h / 2.0) / tile_h;
+      int ty0 = (int) gy;
+      int ty1 = ty0 + 1;
+      gdouble fy = gy - ty0;
+
+      if (ty0 < 0) { ty0 = 0; fy = 0.0; }
+      if (ty1 >= ny) { ty1 = ny - 1; fy = 1.0; if (ty0 >= ny) ty0 = ny - 1; }
+      if (ty0 == ty1) fy = 0.0;
+
+      for (int x = 0; x < width; x++)
+        {
+          gdouble gx = ((gdouble) x - (gdouble) tile_w / 2.0) / tile_w;
+          int tx0 = (int) gx;
+          int tx1 = tx0 + 1;
+          gdouble fx = gx - tx0;
+
+          if (tx0 < 0) { tx0 = 0; fx = 0.0; }
+          if (tx1 >= nx) { tx1 = nx - 1; fx = 1.0; if (tx0 >= nx) tx0 = nx - 1; }
+          if (tx0 == tx1) fx = 0.0;
+
+          guint8 val = buf[y * width + x];
+
+          /* Bilinear interpolation of 4 surrounding tile CDFs */
+          guint8 *lut_tl = cdfs + ((gsize) ty0 * nx + tx0) * 256;
+          guint8 *lut_tr = cdfs + ((gsize) ty0 * nx + tx1) * 256;
+          guint8 *lut_bl = cdfs + ((gsize) ty1 * nx + tx0) * 256;
+          guint8 *lut_br = cdfs + ((gsize) ty1 * nx + tx1) * 256;
+
+          gdouble v = (1.0 - fx) * (1.0 - fy) * lut_tl[val]
+                    + fx         * (1.0 - fy) * lut_tr[val]
+                    + (1.0 - fx) * fy         * lut_bl[val]
+                    + fx         * fy         * lut_br[val];
+
+          buf[y * width + x] = (guint8) CLAMP ((int)(v + 0.5), 0, 255);
+        }
+    }
+
+  g_free (cdfs);
+}
+
+/* Bicubic interpolation kernel (Catmull-Rom, a = -0.5).
+ * w(t) = (a+2)|t|^3 - (a+3)|t|^2 + 1          for |t| <= 1
+ *       = a|t|^3 - 5a|t|^2 + 8a|t| - 4a        for 1 < |t| < 2
+ *       = 0                                      otherwise */
+static inline gdouble
+bicubic_weight (gdouble t)
+{
+  const gdouble a = -0.5;
+  gdouble at = (t < 0) ? -t : t;
+
+  if (at <= 1.0)
+    return (a + 2.0) * at * at * at - (a + 3.0) * at * at + 1.0;
+  else if (at < 2.0)
+    return a * at * at * at - 5.0 * a * at * at + 8.0 * a * at - 4.0 * a;
+  else
+    return 0.0;
+}
+
+/* Bicubic upscale: src (sw x sh) → dst (sw*scale x sh*scale).
+ * Samples a 4x4 neighborhood for each output pixel using Catmull-Rom. */
+static void
+cb_bicubic_upscale (const guint8 *src, int sw, int sh,
+                    guint8 *dst, int scale)
 {
   int dw = sw * scale;
   int dh = sh * scale;
@@ -20,50 +148,38 @@ cb_bilinear_upscale (const guint8 *src, int sw, int sh,
   for (int dy = 0; dy < dh; dy++)
     {
       gdouble sy = ((gdouble) dy + 0.5) / scale - 0.5;
-      int y0 = (int) sy;
-      int y1 = y0 + 1;
-      gdouble fy = sy - y0;
-
-      if (y0 < 0) y0 = 0;
-      if (y1 >= sh) y1 = sh - 1;
+      int iy = (int) floor (sy);
+      gdouble fy = sy - iy;
 
       for (int dx = 0; dx < dw; dx++)
         {
           gdouble sx = ((gdouble) dx + 0.5) / scale - 0.5;
-          int x0 = (int) sx;
-          int x1 = x0 + 1;
-          gdouble fx = sx - x0;
+          int ix = (int) floor (sx);
+          gdouble fx = sx - ix;
 
-          if (x0 < 0) x0 = 0;
-          if (x1 >= sw) x1 = sw - 1;
+          gdouble val = 0.0;
 
-          gdouble v = (1 - fx) * (1 - fy) * src[y0 * sw + x0]
-                    + fx       * (1 - fy) * src[y0 * sw + x1]
-                    + (1 - fx) * fy       * src[y1 * sw + x0]
-                    + fx       * fy       * src[y1 * sw + x1];
+          for (int m = -1; m <= 2; m++)
+            {
+              gdouble wy = bicubic_weight (fy - m);
+              int yy = iy + m;
+              if (yy < 0) yy = 0;
+              if (yy >= sh) yy = sh - 1;
 
-          dst[dy * dw + dx] = (guint8) CLAMP ((int)(v + 0.5), 0, 255);
+              for (int n = -1; n <= 2; n++)
+                {
+                  gdouble wx = bicubic_weight (fx - n);
+                  int xx = ix + n;
+                  if (xx < 0) xx = 0;
+                  if (xx >= sw) xx = sw - 1;
+
+                  val += wy * wx * src[yy * sw + xx];
+                }
+            }
+
+          dst[dy * dw + dx] = (guint8) CLAMP ((int)(val + 0.5), 0, 255);
         }
     }
-}
-
-/* Stretch image contrast to full 0-255 range */
-static void
-cb_contrast_stretch (guint8 *buf, gsize len)
-{
-  guint8 lo = 255, hi = 0;
-
-  for (gsize i = 0; i < len; i++)
-    {
-      if (buf[i] < lo) lo = buf[i];
-      if (buf[i] > hi) hi = buf[i];
-    }
-  if (hi <= lo)
-    return;
-
-  gdouble scale = 255.0 / (hi - lo);
-  for (gsize i = 0; i < len; i++)
-    buf[i] = (guint8) CLAMP ((gint)((buf[i] - lo) * scale), 0, 255);
 }
 
 G_DECLARE_FINAL_TYPE (FpiDeviceCanvasbio, fpi_device_canvasbio, FPI, DEVICE_CANVASBIO, FpImageDevice)
@@ -451,7 +567,60 @@ sync_spi_read_reg_full (int fd, guint8 reg,
   return TRUE;
 }
 
-/* Synchronous init: power on, SPI enable, read HW ID.
+/* Quick re-init: power cycle + SPI enable + HW ID check only.
+ * Skips the 17 register writes — sensor IC retains them across USB reset.
+ * Used for reinit after capture (not first-time cold init). */
+static gboolean
+sync_init_quick (int fd, GError **error)
+{
+  guint8 cc[4];
+  guint8 spi_en[2] = { 0x4F, 0x80 };
+
+  /* Power cycle: ON → OFF → ON */
+  if (!raw_ctrl_write (fd, CY_POWER, 0x0006, 1, error))
+    return FALSE;
+  if (!raw_ctrl_write (fd, CY_POWER, 0x0006, 0, error))
+    return FALSE;
+  if (!raw_ctrl_write (fd, CY_POWER, 0x0006, 1, error))
+    return FALSE;
+  g_usleep (100000);  /* 100ms after power cycle */
+
+  /* SPI enable */
+  if (!raw_ctrl_write (fd, CY_SPI_TRANSFER, SPI_DIR_WRITE, 2, error))
+    return FALSE;
+  if (!raw_bulk_out (fd, spi_en, 2, error))
+    return FALSE;
+  if (raw_ctrl_read (fd, CY_READY_CHECK, 0, cc, 4, error) < 0)
+    return FALSE;
+
+  /* SPI register enable */
+  if (!sync_spi_write_reg (fd, 0x4F, 0x80, error))
+    return FALSE;
+  g_usleep (100000);  /* 100ms after SPI enable */
+
+  /* Verify HW ID */
+  guint8 hw_id = 0;
+  for (int attempt = 0; attempt < 3; attempt++)
+    {
+      hw_id = sync_spi_read_reg (fd, 0xB9, error);
+      if (*error)
+        return FALSE;
+      if (hw_id == 0x34 || hw_id == 0x68)
+        break;
+      g_usleep (50000);
+    }
+  if (hw_id != 0x34 && hw_id != 0x68)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Quick init: bad HW ID 0x%02X", hw_id);
+      return FALSE;
+    }
+
+  fp_dbg ("Quick init OK (HW ID=0x%02X)", hw_id);
+  return TRUE;
+}
+
+/* Full init: power on, SPI enable, read HW ID, write 17 config registers.
  * All I/O via raw USB fd. Returns TRUE on success. */
 static gboolean
 sync_init_early (int fd, GError **error)
@@ -467,7 +636,7 @@ sync_init_early (int fd, GError **error)
     return FALSE;
   if (!raw_ctrl_write (fd, CY_POWER, 0x0006, 1, error))
     return FALSE;
-  g_usleep (1000000);
+  g_usleep (100000);  /* 100ms — MCU needs time after power cycle */
 
   /* SPI enable (raw 2-byte command: 0x4F 0x80) */
   fp_dbg ("INIT: SPI enable");
@@ -477,13 +646,12 @@ sync_init_early (int fd, GError **error)
     return FALSE;
   if (raw_ctrl_read (fd, CY_READY_CHECK, 0, cc, 4, error) < 0)
     return FALSE;
-  g_usleep (500000);
 
   /* SPI register enable */
   fp_dbg ("INIT: register enable");
   if (!sync_spi_write_reg (fd, 0x4F, 0x80, error))
     return FALSE;
-  g_usleep (1000000);
+  g_usleep (100000);  /* 100ms — sensor needs time after SPI enable */
 
   /* Read Hardware ID (retry up to 5 times) */
   guint8 hw_id = 0;
@@ -499,7 +667,11 @@ sync_init_early (int fd, GError **error)
 
   fp_dbg ("Hardware ID: 0x%02X", hw_id);
   if (hw_id != 0x34 && hw_id != 0x68)
-    fp_warn ("Unexpected hardware ID 0x%02X (expected 0x34/0x68) — continuing", hw_id);
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Bad hardware ID 0x%02X (expected 0x34/0x68)", hw_id);
+      return FALSE;
+    }
 
   /* Write all 17 init registers */
   fp_dbg ("INIT: writing %d config registers", (int) G_N_ELEMENTS (init_registers));
@@ -578,7 +750,7 @@ dev_open (FpImageDevice *dev)
         fp_dbg ("Resetting USB device at %s for clean state", reset_path);
         ioctl (reset_fd, USBDEVFS_RESET, NULL);
         close (reset_fd);
-        g_usleep (1000000);  /* Wait 1s for re-enumeration */
+        g_usleep (200000);  /* Wait 200ms for re-enumeration */
       }
   }
 
@@ -785,55 +957,84 @@ sync_trigger_scan (int fd, GError **error)
 }
 
 /* Synchronous: re-init sensor after capture.
- * Closes raw fd, does USB device reset, waits for re-enumeration,
- * reopens fd, does full power cycle + init.
+ * Two tiers:
+ *   Tier 1: clear_halt + SPI test (~50ms if SPI still alive)
+ *   Tier 2: USB reset + quick init (~300ms — skips 17 register writes)
  * Updates self->raw_usb_fd. Returns TRUE on success. */
 static gboolean
 sync_reinit_sensor (FpiDeviceCanvasbio *self, GError **error)
 {
   int fd = self->raw_usb_fd;
-  GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (self));
-  int iface = 0;
-  ioctl (fd, USBDEVFS_RELEASEINTERFACE, &iface);
-  close (fd);
-  self->raw_usb_fd = -1;
 
-  guint8 bus_num = g_usb_device_get_bus (usb);
-  guint8 dev_addr = g_usb_device_get_address (usb);
-  char usb_path[64];
-  snprintf (usb_path, sizeof (usb_path), "/dev/bus/usb/%03u/%03u",
-            bus_num, dev_addr);
+  /* Tier 1: Just clear halted endpoints and test SPI */
+  {
+    unsigned int ep_out = CB_EP_OUT;
+    unsigned int ep_in = CB_EP_IN;
+    ioctl (fd, USBDEVFS_CLEAR_HALT, &ep_out);
+    ioctl (fd, USBDEVFS_CLEAR_HALT, &ep_in);
 
-  int reset_fd = open (usb_path, O_RDWR);
-  if (reset_fd >= 0)
-    {
-      ioctl (reset_fd, USBDEVFS_RESET, NULL);
-      close (reset_fd);
-    }
-  g_usleep (2000000);  /* 2s for re-enumeration */
+    GError *test_err = NULL;
+    guint8 test_val = sync_spi_read_reg (fd, 0xB9, &test_err);
+    if (!test_err && (test_val == 0x68 || test_val == 0x34))
+      {
+        fp_dbg ("Reinit tier1: SPI alive (0x%02X)", test_val);
+        return TRUE;
+      }
+    g_clear_error (&test_err);
+  }
 
-  fd = open (usb_path, O_RDWR);
-  if (fd < 0)
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to reopen %s after reset: %s",
-                   usb_path, g_strerror (errno));
-      return FALSE;
-    }
-  if (ioctl (fd, USBDEVFS_CLAIMINTERFACE, &iface) < 0)
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Failed to re-claim after reset: %s", g_strerror (errno));
-      close (fd);
-      return FALSE;
-    }
-  self->raw_usb_fd = fd;
+  /* Tier 2: USB reset + quick init (no 17 register writes) */
+  fp_dbg ("Reinit tier2: USB reset");
+  {
+    GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (self));
+    int iface = 0;
+    ioctl (fd, USBDEVFS_RELEASEINTERFACE, &iface);
+    close (fd);
+    self->raw_usb_fd = -1;
 
-  if (!sync_init_early (fd, error))
-    return FALSE;
+    guint8 bus_num = g_usb_device_get_bus (usb);
+    guint8 dev_addr = g_usb_device_get_address (usb);
+    char usb_path[64];
+    snprintf (usb_path, sizeof (usb_path), "/dev/bus/usb/%03u/%03u",
+              bus_num, dev_addr);
 
-  fp_dbg ("Sensor re-init done (fd=%d)", fd);
-  return TRUE;
+    int reset_fd = open (usb_path, O_RDWR);
+    if (reset_fd >= 0)
+      {
+        ioctl (reset_fd, USBDEVFS_RESET, NULL);
+        close (reset_fd);
+      }
+    g_usleep (200000);  /* 200ms for re-enumeration */
+
+    fd = open (usb_path, O_RDWR);
+    if (fd < 0)
+      {
+        g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                     "Failed to reopen %s: %s", usb_path, g_strerror (errno));
+        return FALSE;
+      }
+    if (ioctl (fd, USBDEVFS_CLAIMINTERFACE, &iface) < 0)
+      {
+        g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                     "Failed to re-claim: %s", g_strerror (errno));
+        close (fd);
+        return FALSE;
+      }
+    self->raw_usb_fd = fd;
+
+    /* Quick init — sensor IC retains register config across USB reset */
+    if (!sync_init_quick (fd, error))
+      {
+        /* Fall back to full init if quick fails */
+        fp_dbg ("Quick init failed, trying full init");
+        g_clear_error (error);
+        if (!sync_init_early (fd, error))
+          return FALSE;
+      }
+
+    fp_dbg ("Reinit tier2 done (fd=%d)", fd);
+    return TRUE;
+  }
 }
 
 /* Synchronous: full capture cycle (scan → DA → readout → transfer).
@@ -925,19 +1126,23 @@ detect_thread_func (GTask *task, gpointer source_object,
 
   if (image_has_finger (self->img_buf, self->img_offset))
     {
-      fp_dbg ("Finger detected!");
+      fp_dbg ("Finger detected! Reinitializing for next capture...");
+      /* Reinit now so SPI is ready for the next detect cycle.
+       * After image transfer the Cypress MCU SPI bus is corrupted. */
+      GError *reinit_err = NULL;
+      if (!sync_reinit_sensor (self, &reinit_err))
+        fp_warn ("Post-capture reinit failed: %s (non-fatal)", reinit_err->message);
+      g_clear_error (&reinit_err);
       g_task_return_boolean (task, TRUE);
       return;
     }
 
-  /* No finger — reinit for next attempt */
-  fp_dbg ("No finger, reinitializing...");
-  if (!sync_reinit_sensor (self, &error))
-    {
-      g_task_return_error (task, error);
-      return;
-    }
-
+  /* No finger — reinit SPI after bulk transfer before next attempt */
+  fp_dbg ("No finger detected, reinitializing...");
+  GError *reinit_err = NULL;
+  if (!sync_reinit_sensor (self, &reinit_err))
+    fp_warn ("No-finger reinit failed: %s (non-fatal)", reinit_err->message);
+  g_clear_error (&reinit_err);
   g_task_return_boolean (task, FALSE);
 }
 
@@ -979,8 +1184,8 @@ detect_thread_done (GObject *source_object, GAsyncResult *res,
       return;
     }
 
-  /* No finger — schedule retry after 500ms */
-  g_timeout_add (500, detect_retry_cb, dev);
+  /* No finger — schedule retry after 100ms */
+  g_timeout_add (100, detect_retry_cb, dev);
 }
 
 static gboolean
@@ -1136,7 +1341,8 @@ cap_run (FpiSsm *ssm, FpDevice *dev)
 
         fp_dbg ("Submitting pre-captured image: %zd bytes", copy_len);
 
-        /* Contrast stretch disabled — hurts NBIS minutiae matching */
+        /* CLAHE enhancement on raw image */
+        cb_clahe (self->img_buf, IMG_WIDTH, IMG_HEIGHT, 8, 8, 2.5);
 
 #ifdef CB_DEBUG_IMAGES
         {
@@ -1154,19 +1360,17 @@ cap_run (FpiSsm *ssm, FpDevice *dev)
         }
 #endif
 
-        /* 3x bilinear upscale: 112x96 → 336x288.
-         * NBIS needs 300+ pixel images for reliable minutiae extraction.
-         * Bilinear interpolation avoids blocky artifacts from nearest-neighbor. */
+        /* 3x bicubic upscale: 112x96 → 336x288 */
         #define UPSCALE 3
         int dw = IMG_WIDTH * UPSCALE;
         int dh = IMG_HEIGHT * UPSCALE;
 
         FpImage *img = fp_image_new (dw, dh);
-        img->ppmm = 19.685;  /* 500 DPI — NBIS native resolution */
+        img->ppmm = 19.685;
         img->flags = FPI_IMAGE_COLORS_INVERTED;
 
-        cb_bilinear_upscale (self->img_buf, IMG_WIDTH, IMG_HEIGHT,
-                             img->data, UPSCALE);
+        cb_bicubic_upscale (self->img_buf, IMG_WIDTH, IMG_HEIGHT,
+                            img->data, UPSCALE);
 
         fp_dbg ("Submitting image: %dx%d, ppmm=%.2f, flags=0x%x",
                 img->width, img->height, img->ppmm, img->flags);

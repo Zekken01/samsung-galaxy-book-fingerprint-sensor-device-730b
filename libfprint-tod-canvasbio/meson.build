@@ -3,6 +3,8 @@ project('libfprint-tod-canvasbio', 'c',
   default_options: ['c_std=c11', 'warning_level=2'],
 )
 
+cc = meson.get_compiler('c')
+m_dep = cc.find_library('m', required: true)
 glib_dep = dependency('glib-2.0')
 gusb_dep = dependency('gusb')
 tod_dep = dependency('libfprint-2-tod-1')
@@ -17,7 +19,7 @@ endif
 shared_module('libfprint-tod-canvasbio',
   'canvasbio.c',
   c_args: c_args,
-  dependencies: [glib_dep, gusb_dep, tod_dep],
+  dependencies: [glib_dep, gusb_dep, tod_dep, m_dep],
   install: true,
   install_dir: tod_driversdir,
 )
