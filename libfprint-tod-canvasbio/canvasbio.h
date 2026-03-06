@@ -67,8 +67,21 @@ static const RegEntry init_registers[] = {
   { REG_WRITE2, 0x52, 0x2700 },
 };
 
-/* Note: detect_registers removed — finger detection now uses
- * scan_registers + GPIO status poll (0xDA), not SPI reg 0x20 polling. */
+/* Finger-down detect mode entry registers (from protocol section 5.3) */
+static const RegEntry detect_enter_registers[] = {
+  { REG_WRITE2, 0x5D, 0x4D00 },
+  { REG_WRITE2, 0x51, 0xA825 },
+  { REG_WRITE2, 0x03, 0x0000 },
+  { REG_WRITE2, 0x38, 0x0100 },
+  { REG_WRITE2, 0x3D, 0xFF0F },
+  { REG_WRITE2, 0x10, 0x6000 },
+  { REG_WRITE2, 0x3B, 0x1400 },
+  { REG_WRITE2, 0x2F, 0xF6FF },
+  { REG_WRITE2, 0x09, 0x0000 },
+  { REG_WRITE1, 0x0C, 0x0000 },
+  { REG_READ_FULL, 0x20, 0 },
+  { REG_WRITE1, 0x04, 0x0000 },
+};
 
 /* Scan trigger registers (15 operations from trigger_scan()) */
 static const RegEntry scan_registers[] = {
@@ -107,8 +120,15 @@ static const RegEntry readout_registers[] = {
   { REG_WRITE2,    0x09, 0x0000 },
 };
 
-/* Note: poll_cycle_registers removed — detect uses GPIO status poll (0xDA)
- * instead of SPI register 0x20 polling. */
+/* Per-cycle detect poll registers (from protocol section 5.3 poll loop) */
+static const RegEntry detect_poll_registers[] = {
+  { REG_READ,      0x08, 0 },       /* read interrupt status */
+  { REG_WRITE2,    0x09, 0x0000 },  /* clear pending */
+  { REG_WRITE2,    0x03, 0x0000 },
+  { REG_WRITE1,    0x0C, 0x0000 },  /* retrigger detect scan */
+  { REG_READ_FULL, 0x20, 0 },       /* read status → check for 0x0107 */
+  { REG_WRITE1,    0x04, 0x0000 },  /* clear trigger */
+};
 
 /* Instance data struct — declared here, defined via G_DEFINE_TYPE */
 typedef struct _FpiDeviceCanvasbio FpiDeviceCanvasbio;

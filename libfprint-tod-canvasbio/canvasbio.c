@@ -907,31 +907,31 @@ dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 static gboolean sync_readout_and_transfer (FpDevice *dev, GError **error);
 
 /* ========================================================================
- * Finger Detection — Software-based
+ * Finger Detection — Hardware SPI register 0x20 polling
  *
- * The CanvasBio CB2000 has no hardware finger detection. GPIO status (0xDA)
- * is a scan-complete flag, not a finger-presence indicator — it always
- * returns [00 01] almost immediately after scan trigger.
+ * Uses the same approach as the Windows driver:
+ * 1. Enter detect mode (write detect_enter_registers)
+ * 2. Poll SPI reg 0x20 every 15ms — status 0x0107 = finger detected
+ * 3. Every 18 cycles, clear_halt on bulk endpoints to prevent MCU stall
+ * 4. When finger detected → trigger capture + read image
  *
- * Flow:
- * 1. Trigger scan → DA poll (completes in ~10ms)
- * 2. Read image
- * 3. Check image variance: high variance = finger present
- * 4. If no finger → wait 500ms → power cycle → re-scan
- * 5. If finger → report finger_on with pre-captured image
+ * This avoids doing a full image capture just to check finger presence.
  * ======================================================================== */
 
-/* Minimum image variance to consider a finger present.
- * Empirically: blank sensor ~0-10, fingerprint ~200-2000+ */
-#define FINGER_VARIANCE_THRESHOLD 100.0
+/* Max poll cycles before giving up (18 cycles × batches) */
+#define DETECT_CYCLES_PER_BATCH  18   /* clear_halt every 18 cycles (~270ms) */
+#define DETECT_MAX_BATCHES       200  /* ~54 seconds total timeout */
+#define DETECT_POLL_INTERVAL_US  15000  /* 15ms between polls (matches Windows) */
 
-/* Synchronous scan trigger — writes all scan_registers[] back-to-back */
+/* Execute a register table synchronously */
 static gboolean
-sync_trigger_scan (int fd, GError **error)
+sync_exec_reg_table (int fd, const RegEntry *table, gsize len,
+                     guint8 *last_read_out, gsize *last_read_len,
+                     GError **error)
 {
-  for (gsize i = 0; i < G_N_ELEMENTS (scan_registers); i++)
+  for (gsize i = 0; i < len; i++)
     {
-      const RegEntry *e = &scan_registers[i];
+      const RegEntry *e = &table[i];
 
       if (e->op == REG_WRITE2)
         {
@@ -946,14 +946,29 @@ sync_trigger_scan (int fd, GError **error)
         }
       else if (e->op == REG_READ || e->op == REG_READ_FULL)
         {
-          guint8 out[3];
+          guint8 out[4];
           gsize out_len = sizeof (out);
           if (!sync_spi_read_reg_full (fd, e->reg,
                                         out, &out_len, error))
             return FALSE;
+          /* Store last read result for caller to inspect */
+          if (last_read_out && last_read_len)
+            {
+              memcpy (last_read_out, out, MIN (out_len, *last_read_len));
+              *last_read_len = out_len;
+            }
         }
     }
   return TRUE;
+}
+
+/* Synchronous scan trigger — writes all scan_registers[] back-to-back */
+static gboolean
+sync_trigger_scan (int fd, GError **error)
+{
+  return sync_exec_reg_table (fd, scan_registers,
+                               G_N_ELEMENTS (scan_registers),
+                               NULL, NULL, error);
 }
 
 /* Synchronous: re-init sensor after capture.
@@ -1004,7 +1019,7 @@ sync_reinit_sensor (FpiDeviceCanvasbio *self, GError **error)
         ioctl (reset_fd, USBDEVFS_RESET, NULL);
         close (reset_fd);
       }
-    g_usleep (200000);  /* 200ms for re-enumeration */
+    g_usleep (500000);  /* 500ms for re-enumeration */
 
     fd = open (usb_path, O_RDWR);
     if (fd < 0)
@@ -1067,31 +1082,15 @@ sync_full_capture (FpDevice *dev, GError **error)
   return TRUE;
 }
 
-/* Check if captured image has a finger (software detection via variance) */
-static gboolean
-image_has_finger (const guint8 *buf, gsize len)
-{
-  if (len < 100)
-    return FALSE;
-
-  gdouble sum = 0, sum_sq = 0;
-  for (gsize i = 0; i < len; i++)
-    {
-      sum += buf[i];
-      sum_sq += (gdouble) buf[i] * buf[i];
-    }
-  gdouble mean = sum / len;
-  gdouble variance = (sum_sq / len) - (mean * mean);
-
-  fp_dbg ("Image stats: mean=%.1f, variance=%.1f (threshold=%.1f)",
-          mean, variance, FINGER_VARIANCE_THRESHOLD);
-
-  return (variance > FINGER_VARIANCE_THRESHOLD);
-}
-
-/* Thread function: single capture + check.
- * Returns TRUE if finger detected, FALSE (with no error) if no finger.
- * Caller reschedules if no finger. */
+/* Thread function: capture + variance-based finger detection.
+ *
+ * Captures a full image, checks variance to determine finger presence.
+ * This MCU's SPI shift register doesn't support reliable reg 0x20 polling
+ * (response lengths vary due to full-duplex SPI desync), so we use
+ * capture + variance instead.
+ *
+ * Returns TRUE (finger found, image in img_buf) or FALSE (no finger).
+ */
 static void
 detect_thread_func (GTask *task, gpointer source_object,
                     gpointer task_data, GCancellable *cancellable)
@@ -1113,36 +1112,48 @@ detect_thread_func (GTask *task, gpointer source_object,
     {
       fp_warn ("Detect capture failed: %s", error->message);
       g_clear_error (&error);
-      /* Try re-init for next attempt */
-      if (!sync_reinit_sensor (self, &error))
-        {
-          g_task_return_error (task, error);
-          return;
-        }
-      /* Return FALSE (no finger) — will be retried */
+      GError *re = NULL;
+      if (!sync_reinit_sensor (self, &re))
+        fp_warn ("Post-fail reinit: %s (non-fatal)", re->message);
+      g_clear_error (&re);
       g_task_return_boolean (task, FALSE);
       return;
     }
 
-  if (image_has_finger (self->img_buf, self->img_offset))
-    {
-      fp_dbg ("Finger detected! Reinitializing for next capture...");
-      /* Reinit now so SPI is ready for the next detect cycle.
-       * After image transfer the Cypress MCU SPI bus is corrupted. */
-      GError *reinit_err = NULL;
-      if (!sync_reinit_sensor (self, &reinit_err))
-        fp_warn ("Post-capture reinit failed: %s (non-fatal)", reinit_err->message);
-      g_clear_error (&reinit_err);
-      g_task_return_boolean (task, TRUE);
-      return;
-    }
+  /* Check image variance for finger presence */
+  {
+    gdouble sum = 0, sum_sq = 0;
+    gsize len = self->img_offset;
+    for (gsize i = 0; i < len; i++)
+      {
+        sum += self->img_buf[i];
+        sum_sq += (gdouble) self->img_buf[i] * self->img_buf[i];
+      }
+    gdouble mean = sum / len;
+    gdouble variance = (sum_sq / len) - (mean * mean);
 
-  /* No finger — reinit SPI after bulk transfer before next attempt */
-  fp_dbg ("No finger detected, reinitializing...");
-  GError *reinit_err = NULL;
-  if (!sync_reinit_sensor (self, &reinit_err))
-    fp_warn ("No-finger reinit failed: %s (non-fatal)", reinit_err->message);
-  g_clear_error (&reinit_err);
+    fp_dbg ("Detect variance=%.1f (threshold=100)", variance);
+
+    if (variance > 100.0)
+      {
+        fp_dbg ("Finger detected!");
+        /* Reinit for next capture cycle */
+        GError *re = NULL;
+        if (!sync_reinit_sensor (self, &re))
+          fp_warn ("Post-capture reinit: %s (non-fatal)", re->message);
+        g_clear_error (&re);
+        g_task_return_boolean (task, TRUE);
+        return;
+      }
+  }
+
+  /* No finger — reinit for next attempt */
+  {
+    GError *re = NULL;
+    if (!sync_reinit_sensor (self, &re))
+      fp_warn ("No-finger reinit: %s (non-fatal)", re->message);
+    g_clear_error (&re);
+  }
   g_task_return_boolean (task, FALSE);
 }
 
