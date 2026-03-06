@@ -1,8 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::time::{Duration, Instant};
 
-use super::CanvasBioDevice;
 use super::init::SensorInit;
+use super::CanvasBioDevice;
+use crate::usb::error::{classify_usb_error, is_retryable_usb_error};
 
 /// Polling interval for finger-down detection loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(15);
@@ -12,21 +13,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Register 0x20 status value indicating finger is present on sensor.
 const STATUS_FINGER_DOWN: u16 = 0x0107;
-
-/// Finger-down detection mode registers.
-/// These configure the sensor for low-power finger-detect scanning.
-const FINGER_DOWN_MODE_REGS: &[(u8, u16)] = &[
-    (0x5D, 0x4D00), // Detection threshold
-    (0x51, 0xA825), // Scan parameters for detect mode
-    (0x03, 0x0000), // Clear status
-    (0x38, 0x0100), // IRQ enable
-    (0x3D, 0xFF0F), // IRQ mask
-    (0x10, 0x6000), // Detect scan mode
-    (0x3B, 0x1400), // Detect timing
-    (0x2F, 0xF6FF), // Detect reference
-    (0x09, 0x0000), // Clear pending
-    (0x0C, 0x0000), // Trigger detect scan
-];
+/// Maximum duration of one fallback scan-complete probe.
+const FALLBACK_PROBE_MAX: Duration = Duration::from_secs(4);
+/// Minimum remaining time needed to attempt another fallback probe.
+const FALLBACK_PROBE_MIN: Duration = Duration::from_millis(700);
 
 /// Finger-down detection operations.
 pub trait FingerDetect {
@@ -44,14 +34,18 @@ pub trait FingerDetect {
 impl CanvasBioDevice {
     /// Enter finger-down detection mode by writing the detect-mode register set.
     fn write_finger_down_regs(&self) -> Result<()> {
-        // Write detect mode registers via SPI
-        for &(reg, val) in FINGER_DOWN_MODE_REGS {
-            if val <= 0xFF {
-                self.spi_write_reg(reg, val as u8)?;
-            } else {
-                self.spi_write_reg2(reg, val)?;
-            }
-        }
+        // These writes must match the reverse-engineered protocol exactly.
+        // Several 0x0000 values are still 2-byte register writes.
+        self.spi_write_reg2(0x5D, 0x4D00)?;
+        self.spi_write_reg2(0x51, 0xA825)?;
+        self.spi_write_reg2(0x03, 0x0000)?;
+        self.spi_write_reg2(0x38, 0x0100)?;
+        self.spi_write_reg2(0x3D, 0xFF0F)?;
+        self.spi_write_reg2(0x10, 0x6000)?;
+        self.spi_write_reg2(0x3B, 0x1400)?;
+        self.spi_write_reg2(0x2F, 0xF6FF)?;
+        self.spi_write_reg2(0x09, 0x0000)?;
+        self.spi_write_reg(0x0C, 0x00)?;
         Ok(())
     }
 
@@ -92,6 +86,34 @@ impl CanvasBioDevice {
         log::trace!("Detect poll: reg0x20=0x{:04X}", status);
         Ok(status)
     }
+
+    fn wait_finger_down_via_scan_probe(&self, timeout: Duration) -> Result<bool> {
+        println!("[*] Falling back to scan-complete finger detection...");
+        let start = Instant::now();
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Ok(false);
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            if remaining < FALLBACK_PROBE_MIN {
+                log::debug!(
+                    "Skipping fallback probe: remaining {:?} is below minimum {:?}",
+                    remaining,
+                    FALLBACK_PROBE_MIN
+                );
+                return Ok(false);
+            }
+
+            let probe_timeout = std::cmp::min(remaining, FALLBACK_PROBE_MAX);
+            if self.probe_finger_via_scan_complete(probe_timeout)? {
+                println!("[OK] Finger detected!");
+                return Ok(true);
+            }
+
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
 }
 
 impl FingerDetect for CanvasBioDevice {
@@ -127,7 +149,22 @@ impl FingerDetect for CanvasBioDevice {
                 return Ok(false);
             }
 
-            let status = self.poll_detect_cycle()?;
+            let status = match self.poll_detect_cycle() {
+                Ok(status) => status,
+                Err(err) => {
+                    if let Some(kind) = classify_usb_error(&err) {
+                        if is_retryable_usb_error(kind) {
+                            log::warn!(
+                                "Register-poll finger detect failed with {:?}; switching to scan-complete fallback",
+                                kind
+                            );
+                            let remaining = timeout.saturating_sub(start.elapsed());
+                            return self.wait_finger_down_via_scan_probe(remaining);
+                        }
+                    }
+                    return Err(err);
+                }
+            };
 
             if status == STATUS_FINGER_DOWN {
                 println!("[OK] Finger detected!");

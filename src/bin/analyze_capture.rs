@@ -52,9 +52,19 @@ fn parse_tsv(path: &str) -> Result<Vec<Packet>> {
         let time = fields[1].parse::<f64>().unwrap_or(0.0);
         let ep = u8::from_str_radix(fields[2].trim_start_matches("0x"), 16).unwrap_or(0);
         let len = fields[3].parse::<usize>().unwrap_or(0);
-        let data = if fields.len() > 4 { parse_hex(fields[4]) } else { vec![] };
+        let data = if fields.len() > 4 {
+            parse_hex(fields[4])
+        } else {
+            vec![]
+        };
 
-        packets.push(Packet { frame, time, ep, len, data });
+        packets.push(Packet {
+            frame,
+            time,
+            ep,
+            len,
+            data,
+        });
     }
     Ok(packets)
 }
@@ -68,7 +78,11 @@ fn decode_cmd(data: &[u8]) -> String {
             if data.len() == 3 {
                 format!("W1 0x{:02X}=0x{:02X}", data[1], data[2])
             } else if data.len() == 4 {
-                format!("W2 0x{:02X}=0x{:04X}", data[1], ((data[2] as u16) << 8) | data[3] as u16)
+                format!(
+                    "W2 0x{:02X}=0x{:04X}",
+                    data[1],
+                    ((data[2] as u16) << 8) | data[3] as u16
+                )
             } else {
                 format!("WX 0x{:02X} [{}B]", data[1], data.len() - 2)
             }
@@ -80,7 +94,10 @@ fn decode_cmd(data: &[u8]) -> String {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let tsv_path = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/bulk_data.tsv");
+    let tsv_path = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("/tmp/bulk_data.tsv");
 
     let packets = parse_tsv(tsv_path)?;
 
@@ -94,19 +111,35 @@ fn main() -> Result<()> {
     let mut out_sizes: BTreeMap<usize, usize> = BTreeMap::new();
     let mut in_sizes: BTreeMap<usize, usize> = BTreeMap::new();
     for p in &packets {
-        let map = if p.ep == EP_OUT { &mut out_sizes } else { &mut in_sizes };
+        let map = if p.ep == EP_OUT {
+            &mut out_sizes
+        } else {
+            &mut in_sizes
+        };
         *map.entry(p.len).or_insert(0) += 1;
     }
     println!("\nOUT packet sizes: {:?}", out_sizes);
     println!("IN  packet sizes: {:?}", in_sizes);
 
     // Large IN transfers
-    let large_in: Vec<&Packet> = packets.iter().filter(|p| p.ep == EP_IN && p.len > 10).collect();
+    let large_in: Vec<&Packet> = packets
+        .iter()
+        .filter(|p| p.ep == EP_IN && p.len > 10)
+        .collect();
     println!("\nLarge IN packets (>10B): {}", large_in.len());
     for p in large_in.iter().take(20) {
-        let preview: String = p.data.iter().take(20).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+        let preview: String = p
+            .data
+            .iter()
+            .take(20)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
         let ellipsis = if p.data.len() > 20 { "..." } else { "" };
-        println!("  [{:>5}] t={:.3}s  {:>5}B  {}{}", p.frame, p.time, p.len, preview, ellipsis);
+        println!(
+            "  [{:>5}] t={:.3}s  {:>5}B  {}{}",
+            p.frame, p.time, p.len, preview, ellipsis
+        );
     }
 
     // Group by time gaps (>0.5s = new phase)
@@ -136,7 +169,8 @@ fn main() -> Result<()> {
         let duration = last.time - first.time;
         let phase_n_out = indices.iter().filter(|&&i| packets[i].ep == EP_OUT).count();
         let phase_n_in = indices.iter().filter(|&&i| packets[i].ep == EP_IN).count();
-        let total_in_bytes: usize = indices.iter()
+        let total_in_bytes: usize = indices
+            .iter()
             .filter(|&&i| packets[i].ep == EP_IN)
             .map(|&i| packets[i].len)
             .sum();
@@ -151,9 +185,17 @@ fn main() -> Result<()> {
             "unknown"
         };
 
-        println!("\nPhase {}: t={:.3}-{:.3}s ({:.3}s) OUT={} IN={} IN_bytes={} [{}]",
-            phase_idx, first.time, last.time, duration,
-            phase_n_out, phase_n_in, total_in_bytes, phase_type);
+        println!(
+            "\nPhase {}: t={:.3}-{:.3}s ({:.3}s) OUT={} IN={} IN_bytes={} [{}]",
+            phase_idx,
+            first.time,
+            last.time,
+            duration,
+            phase_n_out,
+            phase_n_in,
+            total_in_bytes,
+            phase_type
+        );
 
         let mut cmds_shown = 0;
         for &i in indices {
@@ -162,20 +204,33 @@ fn main() -> Result<()> {
                 println!("    [{:>5}] OUT {}", p.frame, decode_cmd(&p.data));
                 cmds_shown += 1;
                 if cmds_shown >= 8 {
-                    let remaining = indices.iter()
+                    let remaining = indices
+                        .iter()
                         .filter(|&&j| packets[j].ep == EP_OUT && !packets[j].data.is_empty())
-                        .count() - cmds_shown;
+                        .count()
+                        - cmds_shown;
                     if remaining > 0 {
                         println!("    ... +{} more OUT commands", remaining);
                     }
                     break;
                 }
             } else if p.ep == EP_IN && p.len > 10 {
-                let preview: String = p.data.iter().take(30).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                let preview: String = p
+                    .data
+                    .iter()
+                    .take(30)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join("");
                 let ellipsis = if p.data.len() > 30 { "..." } else { "" };
-                println!("    [{:>5}] IN  {}B: {}{}", p.frame, p.len, preview, ellipsis);
+                println!(
+                    "    [{:>5}] IN  {}B: {}{}",
+                    p.frame, p.len, preview, ellipsis
+                );
                 cmds_shown += 1;
-                if cmds_shown >= 8 { break; }
+                if cmds_shown >= 8 {
+                    break;
+                }
             }
         }
     }
@@ -206,7 +261,12 @@ fn main() -> Result<()> {
         if vals.len() <= 5 {
             println!("  reg 0x{:02X}: {}", reg, vals.join(", "));
         } else {
-            println!("  reg 0x{:02X}: {} ... ({} unique values)", reg, vals[..5].join(", "), vals.len());
+            println!(
+                "  reg 0x{:02X}: {} ... ({} unique values)",
+                reg,
+                vals[..5].join(", "),
+                vals.len()
+            );
         }
     }
 
@@ -226,7 +286,10 @@ fn main() -> Result<()> {
                     let val = if resp.len() >= 3 {
                         format!("0x{:02X}", resp[2])
                     } else {
-                        resp.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+                        resp.iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join("")
                     };
                     let vals = reg_reads.entry(reg).or_default();
                     if !vals.contains(&val) {
@@ -241,7 +304,12 @@ fn main() -> Result<()> {
         if vals.len() <= 10 {
             println!("  reg 0x{:02X}: {}", reg, vals.join(", "));
         } else {
-            println!("  reg 0x{:02X}: {} ... ({} unique values)", reg, vals[..5].join(", "), vals.len());
+            println!(
+                "  reg 0x{:02X}: {} ... ({} unique values)",
+                reg,
+                vals[..5].join(", "),
+                vals.len()
+            );
         }
     }
 
@@ -277,13 +345,34 @@ fn main() -> Result<()> {
                     }
                 }
 
-                println!("\n  Capture #{}: frames {}-{}, t={:.3}s, {} transfers, {} bytes",
-                    capture_count, start_frame, end_frame, start_time, n_transfers, total_bytes);
+                println!(
+                    "\n  Capture #{}: frames {}-{}, t={:.3}s, {} transfers, {} bytes",
+                    capture_count, start_frame, end_frame, start_time, n_transfers, total_bytes
+                );
                 if !pre_cmds.is_empty() {
-                    let show: Vec<&String> = pre_cmds.iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
-                    println!("    Preceding: {}", show.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                    let show: Vec<&String> = pre_cmds
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    println!(
+                        "    Preceding: {}",
+                        show.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
-                let first_data: String = packets[i].data.iter().take(40).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                let first_data: String = packets[i]
+                    .data
+                    .iter()
+                    .take(40)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join("");
                 println!("    First data: {}...", first_data);
             }
             i = j;
@@ -294,4 +383,48 @@ fn main() -> Result<()> {
     println!("\n  Total image captures: {}", capture_count);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_file(contents: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before UNIX_EPOCH")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("canvasbio_analyze_{stamp}.tsv"));
+        fs::write(&path, contents).expect("failed to write temp tsv");
+        path
+    }
+
+    #[test]
+    fn parse_hex_ignores_separators() {
+        assert_eq!(parse_hex("a8:06:00"), vec![0xA8, 0x06, 0x00]);
+        assert_eq!(parse_hex("43 59 55 53"), vec![0x43, 0x59, 0x55, 0x53]);
+    }
+
+    #[test]
+    fn parse_tsv_reads_basic_packets() {
+        let path = write_temp_file("1\t0.001\t0x01\t3\ta80600\n2\t0.002\t0x82\t3\t000001\n");
+        let packets = parse_tsv(path.to_str().expect("utf8 path")).expect("parse_tsv failed");
+        fs::remove_file(path).ok();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].frame, 1);
+        assert_eq!(packets[0].ep, EP_OUT);
+        assert_eq!(packets[0].data, vec![0xA8, 0x06, 0x00]);
+        assert_eq!(packets[1].ep, EP_IN);
+    }
+
+    #[test]
+    fn decode_cmd_formats_spi_commands() {
+        assert_eq!(decode_cmd(&[0xA9, 0x4F, 0x80]), "W1 0x4F=0x80");
+        assert_eq!(decode_cmd(&[0xA9, 0x51, 0xA8, 0x25]), "W2 0x51=0xA825");
+        assert_eq!(decode_cmd(&[0xA8, 0x20, 0x00]), "RD 0x20");
+    }
 }

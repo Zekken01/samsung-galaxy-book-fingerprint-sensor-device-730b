@@ -152,9 +152,14 @@ Phase 4: Bulk Image Transfer
 ### Finger-Down Detection
 
 ```
-Configure detect-mode registers → Poll SPI register 0x20
-  0x0102 = no finger
-  0x0107 = finger detected
+Rust CLI path:
+  Configure detect-mode registers → Poll SPI register 0x20
+    0x0102 = no finger
+    0x0107 = finger detected
+
+libfprint TOD path:
+  Capture frame → compute image variance
+    variance > 100 => finger detected
 ```
 
 ## Project Structure
@@ -206,7 +211,7 @@ A C-based libfprint Touch OEM Driver (TOD) plugin lives in `libfprint-tod-canvas
 
 - **All USB I/O via raw ioctls** — `USBDEVFS_CONTROL` and `USBDEVFS_BULK` for maximum reliability with this device
 - **Software finger detection** — Image variance analysis (threshold > 100) distinguishes finger from blank sensor
-- **3x bilinear upscale** — 112x96 → 336x288 with bilinear interpolation for reliable NBIS minutiae extraction (64-98 minutiae per image)
+- **3x bicubic upscale** — 112x96 → 336x288 with bicubic interpolation for reliable NBIS minutiae extraction (64-98 minutiae per image)
 - **Automatic USB reset recovery** — Post-capture SPI state corruption handled via USB device reset cycle
 - **Debug image dumps** — Build with `meson setup build -Ddebug_images=true` to write raw PGM files to `/tmp/`
 
@@ -237,6 +242,12 @@ sudo pam-auth-update --enable fprintd   # Enable for login/sudo
 ## Device Recovery
 
 If the device firmware crashes (USB protocol error -71), a USB reset is **not sufficient**. Full power off for 30+ seconds is required.
+
+Common runtime recovery hints now surfaced by the Rust CLI:
+- `Access` / permission errors: run as root or install udev rule
+- `Busy`: stop competing users (`fprintd`, other capture sessions)
+- `Pipe` / `Io` / `Other`: reconnect USB, then retry; if repeated, full power-off for 30+ seconds
+- Rust CLI automatically performs one reopen+reinit retry for transient USB errors during `wait`/`capture`
 
 ## References
 

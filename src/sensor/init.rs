@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::time::Duration;
 
+use super::CanvasBioDevice;
 use crate::usb::transfer::*;
 use crate::usb::{BulkTransfer, CypressControl};
-use super::CanvasBioDevice;
 
 // Sensor configuration registers (from Windows driver capture)
 const INIT_REGISTERS: &[(u8, u16)] = &[
@@ -74,11 +74,18 @@ impl SensorInit for CanvasBioDevice {
     fn print_info(&self) -> Result<()> {
         let mut buf = [0u8; 4];
         self.usb.cy_vendor_read(0xBD, &mut buf)?;
-        println!("  Cypress MCU: {} ({:02x?})", String::from_utf8_lossy(&buf), buf);
+        println!(
+            "  Cypress MCU: {} ({:02x?})",
+            String::from_utf8_lossy(&buf),
+            buf
+        );
 
         let mut ver = [0u8; 8];
         self.usb.cy_vendor_read(0xB0, &mut ver)?;
-        println!("  Firmware: v{}.{}.{}, mode='{}'", ver[0], ver[1], ver[2], ver[4] as char);
+        println!(
+            "  Firmware: v{}.{}.{}, mode='{}'",
+            ver[0], ver[1], ver[2], ver[4] as char
+        );
 
         let mut build = [0u8; 4];
         self.usb.cy_vendor_read(0xB1, &mut build)?;

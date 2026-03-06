@@ -1,10 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::time::{Duration, Instant};
 
+use super::init::SensorInit;
+use super::CanvasBioDevice;
 use crate::usb::transfer::*;
 use crate::usb::{BulkTransfer, CypressControl};
-use super::CanvasBioDevice;
-use super::init::SensorInit;
 
 pub const IMG_WIDTH: u32 = 112;
 pub const IMG_HEIGHT: u32 = 96;
@@ -44,13 +44,13 @@ impl CanvasBioDevice {
         self.spi_write_reg2(0x52, 0x2700)?;
         self.spi_write_reg2(0x09, 0x0000)?;
         self.spi_write_reg2(0x5D, 0x4D00)?;
-        self.spi_write_reg2(0x51, 0xA825)?;  // scan mode (not 0x3A25)
+        self.spi_write_reg2(0x51, 0xA825)?; // scan mode (not 0x3A25)
         self.spi_write_reg(0x03, 0x00)?;
-        self.spi_write_reg2(0x38, 0x0100)?;  // scan-only register
-        self.spi_write_reg2(0x3D, 0xFF0F)?;  // scan-only register
-        self.spi_write_reg2(0x10, 0x6000)?;  // scan mode (not 0x0001)
-        self.spi_write_reg2(0x3B, 0x1400)?;  // scan-only register
-        self.spi_write_reg2(0x2F, 0xF6FF)?;  // scan mode (not 0xEF00)
+        self.spi_write_reg2(0x38, 0x0100)?; // scan-only register
+        self.spi_write_reg2(0x3D, 0xFF0F)?; // scan-only register
+        self.spi_write_reg2(0x10, 0x6000)?; // scan mode (not 0x0001)
+        self.spi_write_reg2(0x3B, 0x1400)?; // scan-only register
+        self.spi_write_reg2(0x2F, 0xF6FF)?; // scan mode (not 0xEF00)
         self.spi_write_reg2(0x09, 0x0000)?;
         self.spi_write_reg(0x0C, 0x00)?;
         self.spi_read_reg_full(0x20)?;
@@ -81,6 +81,29 @@ impl CanvasBioDevice {
         self.spi_write_reg2(0x04, 0x0000)?;
         self.spi_write_reg2(0x09, 0x0000)?;
         Ok(())
+    }
+
+    /// Fast finger-presence probe using only scan trigger + DA completion.
+    ///
+    /// Returns `Ok(true)` when the sensor reports scan completion within
+    /// `scan_timeout`, which typically indicates finger contact.
+    /// Returns `Ok(false)` on scan timeout (no finger).
+    pub(crate) fn probe_finger_via_scan_complete(&self, scan_timeout: Duration) -> Result<bool> {
+        if !self.initialized {
+            bail!("Sensor not initialized");
+        }
+
+        self.trigger_scan()?;
+        match self.usb.poll_scan_complete(scan_timeout) {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                if err.to_string().contains("Scan timeout") {
+                    Ok(false)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 }
 
@@ -164,12 +187,21 @@ impl SensorCapture for CanvasBioDevice {
         image.truncate(IMG_SIZE);
 
         if image.len() < IMG_SIZE {
-            log::warn!("Short image: {} bytes (expected {}), padding with zeros", image.len(), IMG_SIZE);
+            log::warn!(
+                "Short image: {} bytes (expected {}), padding with zeros",
+                image.len(),
+                IMG_SIZE
+            );
             image.resize(IMG_SIZE, 0);
         }
 
-        println!("  Image captured: {}x{} ({} bytes), transfer: {:.0}ms",
-                 IMG_WIDTH, IMG_HEIGHT, image.len(), transfer_ms);
+        println!(
+            "  Image captured: {}x{} ({} bytes), transfer: {:.0}ms",
+            IMG_WIDTH,
+            IMG_HEIGHT,
+            image.len(),
+            transfer_ms
+        );
         Ok(image)
     }
 }

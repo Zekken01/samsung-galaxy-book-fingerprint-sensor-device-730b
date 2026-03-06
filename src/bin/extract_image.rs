@@ -63,9 +63,19 @@ fn parse_tsv(path: &str) -> Result<Vec<Packet>> {
         let time = fields[1].parse::<f64>().unwrap_or(0.0);
         let ep = u8::from_str_radix(fields[2].trim_start_matches("0x"), 16).unwrap_or(0);
         let len = fields[3].parse::<usize>().unwrap_or(0);
-        let data = if fields.len() > 4 { parse_hex(fields[4]) } else { vec![] };
+        let data = if fields.len() > 4 {
+            parse_hex(fields[4])
+        } else {
+            vec![]
+        };
 
-        packets.push(Packet { frame, time, ep, len, data });
+        packets.push(Packet {
+            frame,
+            time,
+            ep,
+            len,
+            data,
+        });
     }
     Ok(packets)
 }
@@ -109,7 +119,10 @@ fn extract_images(packets: &[Packet]) -> Vec<CapturedImage> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let tsv_path = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/bulk_data.tsv");
+    let tsv_path = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("/tmp/bulk_data.tsv");
     let out_dir = args.get(2).map(|s| s.as_str()).unwrap_or("captures/images");
 
     fs::create_dir_all(out_dir).context("Failed to create output directory")?;
@@ -120,8 +133,13 @@ fn main() -> Result<()> {
     println!("Found {} fingerprint images", images.len());
 
     for (idx, img) in images.iter().enumerate() {
-        println!("\n  Image #{}: frame={}, t={:.3}s, {}B",
-            idx + 1, img.frame, img.time, img.data.len());
+        println!(
+            "\n  Image #{}: frame={}, t={:.3}s, {}B",
+            idx + 1,
+            img.frame,
+            img.time,
+            img.data.len()
+        );
 
         // Save raw binary
         let raw_path = Path::new(out_dir).join(format!("fp_raw_{:02}.bin", idx));
@@ -132,18 +150,27 @@ fn main() -> Result<()> {
         if img.data.len() >= IMG_SIZE {
             let pixel_data = img.data[..IMG_SIZE].to_vec();
             if let Some(gray_img) = image::GrayImage::from_raw(WIDTH, HEIGHT, pixel_data) {
-                let png_path = Path::new(out_dir).join(format!("fp_{:02}_{}x{}.png", idx, WIDTH, HEIGHT));
-                gray_img.save(&png_path)
+                let png_path =
+                    Path::new(out_dir).join(format!("fp_{:02}_{}x{}.png", idx, WIDTH, HEIGHT));
+                gray_img
+                    .save(&png_path)
                     .with_context(|| format!("Failed to save {}", png_path.display()))?;
-                println!("    PNG saved: {} ({}x{} 8-bit)", png_path.display(), WIDTH, HEIGHT);
+                println!(
+                    "    PNG saved: {} ({}x{} 8-bit)",
+                    png_path.display(),
+                    WIDTH,
+                    HEIGHT
+                );
             }
 
             // Also try with 3-byte offset (first transfer may have SPI header)
             if img.data.len() >= IMG_SIZE + 3 {
                 let offset_data = img.data[3..IMG_SIZE + 3].to_vec();
                 if let Some(gray_img) = image::GrayImage::from_raw(WIDTH, HEIGHT, offset_data) {
-                    let png_path = Path::new(out_dir).join(format!("fp_{:02}_{}x{}_off3.png", idx, WIDTH, HEIGHT));
-                    gray_img.save(&png_path)
+                    let png_path = Path::new(out_dir)
+                        .join(format!("fp_{:02}_{}x{}_off3.png", idx, WIDTH, HEIGHT));
+                    gray_img
+                        .save(&png_path)
                         .with_context(|| format!("Failed to save {}", png_path.display()))?;
                     println!("    PNG saved: {} (3B offset)", png_path.display());
                 }
@@ -154,10 +181,106 @@ fn main() -> Result<()> {
     println!("\n{}", "=".repeat(60));
     println!("Total images extracted: {}", images.len());
     if !images.is_empty() {
-        let sizes: std::collections::BTreeSet<usize> = images.iter().map(|img| img.data.len()).collect();
+        let sizes: std::collections::BTreeSet<usize> =
+            images.iter().map(|img| img.data.len()).collect();
         println!("Image sizes: {:?}", sizes);
         println!("Expected for {}x{}@8bpp: {}B", WIDTH, HEIGHT, IMG_SIZE);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_file(contents: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before UNIX_EPOCH")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("canvasbio_extract_{stamp}.tsv"));
+        fs::write(&path, contents).expect("failed to write temp tsv");
+        path
+    }
+
+    #[test]
+    fn parse_tsv_reads_packets() {
+        let path = write_temp_file("10\t1.200\t0x01\t3\ta80600\n11\t1.201\t0x82\t3\t000001\n");
+        let packets = parse_tsv(path.to_str().expect("utf8 path")).expect("parse_tsv failed");
+        fs::remove_file(path).ok();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].frame, 10);
+        assert_eq!(packets[0].ep, EP_OUT);
+        assert_eq!(packets[1].ep, EP_IN);
+    }
+
+    #[test]
+    fn extract_images_collects_full_image_stream() {
+        let mut packets = Vec::new();
+        packets.push(Packet {
+            frame: 1,
+            time: 0.0,
+            ep: EP_OUT,
+            len: 3,
+            data: vec![0xA8, 0x06, 0x00],
+        });
+
+        for i in 0..42 {
+            packets.push(Packet {
+                frame: 2 + i,
+                time: 0.001 + (i as f64 * 0.001),
+                ep: EP_IN,
+                len: 256,
+                data: vec![i as u8; 256],
+            });
+        }
+
+        let images = extract_images(&packets);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data.len(), IMG_SIZE);
+        assert_eq!(images[0].data[0], 0);
+        assert_eq!(images[0].data[256], 1);
+    }
+
+    #[test]
+    fn extract_images_strips_three_byte_header_for_259b_packets() {
+        let mut packets = Vec::new();
+        packets.push(Packet {
+            frame: 1,
+            time: 0.0,
+            ep: EP_OUT,
+            len: 3,
+            data: vec![0xA8, 0x06, 0x00],
+        });
+
+        let mut first = vec![0xDE, 0xAD, 0xBE];
+        first.extend_from_slice(&vec![7u8; 256]);
+        packets.push(Packet {
+            frame: 2,
+            time: 0.001,
+            ep: EP_IN,
+            len: 259,
+            data: first,
+        });
+
+        for i in 0..41 {
+            packets.push(Packet {
+                frame: 3 + i,
+                time: 0.002 + (i as f64 * 0.001),
+                ep: EP_IN,
+                len: 256,
+                data: vec![0u8; 256],
+            });
+        }
+
+        let images = extract_images(&packets);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data.len(), IMG_SIZE);
+        assert_eq!(images[0].data[0], 7);
+    }
 }

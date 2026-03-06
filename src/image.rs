@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::sensor::capture::{IMG_WIDTH, IMG_HEIGHT};
+use crate::sensor::capture::{IMG_HEIGHT, IMG_WIDTH};
 
 pub fn save_image(data: &[u8], path: &Path) -> Result<()> {
     let img = image::GrayImage::from_raw(IMG_WIDTH, IMG_HEIGHT, data.to_vec())

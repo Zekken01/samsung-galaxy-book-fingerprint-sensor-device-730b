@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
+use super::error::usb_operation_error;
 use super::UsbDevice;
 
 const EP_OUT: u8 = 0x01;
@@ -12,7 +13,7 @@ const CY_SPI_TRANSFER: u8 = 0xCA;
 const CY_READY_CHECK: u8 = 0xCC;
 pub(crate) const CY_POWER: u8 = 0xDB;
 /// GPIO/interrupt status register — used to poll scan completion.
-/// Read with wValue=0x0007; returns 2 bytes, [0x01, 0x00] when scan is done.
+/// Read with wValue=0x0007; returns 2 bytes, [0x00, 0x01] when scan is done.
 pub(crate) const CY_GPIO_STATUS: u8 = 0xDA;
 
 // SPI direction flags (wValue for 0xCA)
@@ -42,17 +43,37 @@ pub trait BulkTransfer {
 
 impl CypressControl for UsbDevice {
     fn cy_vendor_write(&self, request: u8, value: u16, index: u16) -> Result<()> {
-        self.handle.write_control(0x40, request, value, index, &[], TIMEOUT_CMD)?;
+        self.handle
+            .write_control(0x40, request, value, index, &[], TIMEOUT_CMD)
+            .map_err(|e| {
+                usb_operation_error(
+                    &format!(
+                        "control write (req=0x{request:02X}, wValue=0x{value:04X}, wIndex=0x{index:04X})"
+                    ),
+                    e,
+                )
+            })?;
         Ok(())
     }
 
     fn cy_vendor_read(&self, request: u8, buf: &mut [u8]) -> Result<usize> {
-        let n = self.handle.read_control(0xC0, request, 0, 0, buf, TIMEOUT_CMD)?;
+        let n = self
+            .handle
+            .read_control(0xC0, request, 0, 0, buf, TIMEOUT_CMD)
+            .map_err(|e| usb_operation_error(&format!("control read (req=0x{request:02X})"), e))?;
         Ok(n)
     }
 
     fn cy_vendor_read_wval(&self, request: u8, value: u16, buf: &mut [u8]) -> Result<usize> {
-        let n = self.handle.read_control(0xC0, request, value, 0, buf, TIMEOUT_CMD)?;
+        let n = self
+            .handle
+            .read_control(0xC0, request, value, 0, buf, TIMEOUT_CMD)
+            .map_err(|e| {
+                usb_operation_error(
+                    &format!("control read (req=0x{request:02X}, wValue=0x{value:04X})"),
+                    e,
+                )
+            })?;
         Ok(n)
     }
 
@@ -76,12 +97,17 @@ impl CypressControl for UsbDevice {
             let mut buf = [0u8; 2];
             self.cy_vendor_read_wval(CY_GPIO_STATUS, 0x0007, &mut buf)?;
             if buf[1] == 0x01 {
-                log::debug!("Scan complete after {:.0}ms", start.elapsed().as_secs_f64() * 1000.0);
+                log::debug!(
+                    "Scan complete after {:.0}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
                 return Ok(());
             }
             if start.elapsed() > timeout {
-                anyhow::bail!("Scan timeout after {:.1}s (sensor never signaled ready)",
-                             timeout.as_secs_f64());
+                anyhow::bail!(
+                    "Scan timeout after {:.1}s (sensor never signaled ready)",
+                    timeout.as_secs_f64()
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -90,17 +116,31 @@ impl CypressControl for UsbDevice {
 
 impl BulkTransfer for UsbDevice {
     fn bulk_write(&self, data: &[u8]) -> Result<()> {
-        self.handle.write_bulk(EP_OUT, data, TIMEOUT_CMD)?;
+        self.handle
+            .write_bulk(EP_OUT, data, TIMEOUT_CMD)
+            .map_err(|e| {
+                usb_operation_error(
+                    &format!("bulk write (ep=0x{EP_OUT:02X}, len={})", data.len()),
+                    e,
+                )
+            })?;
         Ok(())
     }
 
     fn bulk_read(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        let n = self.handle.read_bulk(EP_IN, buf, timeout)?;
+        let n = self.handle.read_bulk(EP_IN, buf, timeout).map_err(|e| {
+            usb_operation_error(
+                &format!("bulk read (ep=0x{EP_IN:02X}, timeout={:?})", timeout),
+                e,
+            )
+        })?;
         Ok(n)
     }
 
     fn clear_halt_out(&self) -> Result<()> {
-        self.handle.clear_halt(EP_OUT)?;
+        self.handle
+            .clear_halt(EP_OUT)
+            .map_err(|e| usb_operation_error(&format!("clear_halt (ep=0x{EP_OUT:02X})"), e))?;
         Ok(())
     }
 }
