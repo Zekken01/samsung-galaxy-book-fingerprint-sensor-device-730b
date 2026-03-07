@@ -108,6 +108,13 @@ CONTROL
 cat > "$PKG_ROOT/DEBIAN/postinst" <<'POSTINST'
 #!/usr/bin/env bash
 set -e
+mkdir -p /etc/systemd/system/fprintd.service.d
+cat > /etc/systemd/system/fprintd.service.d/canvasbio-tuning.conf <<'EOF'
+[Service]
+Environment=CANVASBIO_DETECT_PROBE_MS=170
+Environment=CANVASBIO_DETECT_RETRY_MS=30
+EOF
+systemctl daemon-reload || true
 udevadm control --reload-rules || true
 udevadm trigger || true
 systemctl restart fprintd || pkill -9 fprintd || true
@@ -120,6 +127,17 @@ Next steps:
 MSG
 POSTINST
 chmod 755 "$PKG_ROOT/DEBIAN/postinst"
+
+cat > "$PKG_ROOT/DEBIAN/postrm" <<'POSTRM'
+#!/usr/bin/env bash
+set -e
+if [[ "${1:-}" = "purge" ]]; then
+  rm -f /etc/systemd/system/fprintd.service.d/canvasbio-tuning.conf || true
+  systemctl daemon-reload || true
+  systemctl restart fprintd || pkill -9 fprintd || true
+fi
+POSTRM
+chmod 755 "$PKG_ROOT/DEBIAN/postrm"
 
 mkdir -p "$DIST_DIR"
 log "Building .deb package"

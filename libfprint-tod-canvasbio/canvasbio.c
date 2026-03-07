@@ -922,6 +922,73 @@ static gboolean sync_readout_and_transfer (FpDevice *dev, GError **error);
 #define DETECT_CYCLES_PER_BATCH  18   /* clear_halt every 18 cycles (~270ms) */
 #define DETECT_MAX_BATCHES       200  /* ~54 seconds total timeout */
 #define DETECT_POLL_INTERVAL_US  15000  /* 15ms between polls (matches Windows) */
+#define DETECT_FAST_PROBE_TIMEOUT_MS_DEFAULT 180
+#define DETECT_FAST_PROBE_TIMEOUT_MS_MIN 80
+#define DETECT_FAST_PROBE_TIMEOUT_MS_MAX 800
+#define DETECT_RETRY_DELAY_MS_DEFAULT 35
+#define DETECT_RETRY_DELAY_MS_MIN 10
+#define DETECT_RETRY_DELAY_MS_MAX 250
+
+static guint
+cb_env_uint (const char *key, guint fallback, guint min, guint max)
+{
+  const gchar *val = g_getenv (key);
+  if (!val || !*val)
+    return fallback;
+
+  gchar *end = NULL;
+  guint64 parsed = g_ascii_strtoull (val, &end, 10);
+  if (end == val || *end != '\0')
+    {
+      fp_warn ("Invalid %s='%s'; using default %u", key, val, fallback);
+      return fallback;
+    }
+
+  if (parsed < min || parsed > max)
+    {
+      fp_warn ("Out-of-range %s='%s' (valid %u-%u); using default %u",
+               key, val, min, max, fallback);
+      return fallback;
+    }
+
+  return (guint) parsed;
+}
+
+static guint
+cb_detect_fast_probe_timeout_ms (void)
+{
+  static gsize inited = 0;
+  static guint cached = DETECT_FAST_PROBE_TIMEOUT_MS_DEFAULT;
+
+  if (g_once_init_enter (&inited))
+    {
+      cached = cb_env_uint ("CANVASBIO_DETECT_PROBE_MS",
+                            DETECT_FAST_PROBE_TIMEOUT_MS_DEFAULT,
+                            DETECT_FAST_PROBE_TIMEOUT_MS_MIN,
+                            DETECT_FAST_PROBE_TIMEOUT_MS_MAX);
+      g_once_init_leave (&inited, 1);
+    }
+
+  return cached;
+}
+
+static guint
+cb_detect_retry_delay_ms (void)
+{
+  static gsize inited = 0;
+  static guint cached = DETECT_RETRY_DELAY_MS_DEFAULT;
+
+  if (g_once_init_enter (&inited))
+    {
+      cached = cb_env_uint ("CANVASBIO_DETECT_RETRY_MS",
+                            DETECT_RETRY_DELAY_MS_DEFAULT,
+                            DETECT_RETRY_DELAY_MS_MIN,
+                            DETECT_RETRY_DELAY_MS_MAX);
+      g_once_init_leave (&inited, 1);
+    }
+
+  return cached;
+}
 
 /* Execute a register table synchronously */
 static gboolean
@@ -1144,7 +1211,8 @@ detect_thread_func (GTask *task, gpointer source_object,
    * and avoid full image transfer + USB reset cycle. */
   {
     gboolean ready = FALSE;
-    if (!sync_probe_scan_ready (self->raw_usb_fd, 400, &ready, &error))
+    guint probe_timeout_ms = cb_detect_fast_probe_timeout_ms ();
+    if (!sync_probe_scan_ready (self->raw_usb_fd, probe_timeout_ms, &ready, &error))
       {
         fp_warn ("Detect probe failed: %s", error->message);
         g_clear_error (&error);
@@ -1251,8 +1319,8 @@ detect_thread_done (GObject *source_object, GAsyncResult *res,
       return;
     }
 
-  /* No finger — schedule retry after 100ms */
-  g_timeout_add (100, detect_retry_cb, dev);
+  /* No finger — schedule retry quickly to improve responsiveness. */
+  g_timeout_add (cb_detect_retry_delay_ms (), detect_retry_cb, dev);
 }
 
 static gboolean

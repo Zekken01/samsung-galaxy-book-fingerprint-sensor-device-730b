@@ -6,6 +6,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TOD_DIR="${REPO_ROOT}/libfprint-tod-canvasbio"
 CONFIGURE_PAM=0
 CONFIGURE_PAM_FORCE=0
+DETECT_PROBE_MS=170
+DETECT_RETRY_MS=30
+SYSTEMD_DROPIN_DIR="/etc/systemd/system/fprintd.service.d"
+SYSTEMD_DROPIN_FILE="${SYSTEMD_DROPIN_DIR}/canvasbio-tuning.conf"
 
 usage() {
   cat <<USAGE
@@ -29,6 +33,18 @@ require_cmd() {
     echo "Missing required command: $1" >&2
     exit 1
   fi
+}
+
+apply_persistent_tuning_profile() {
+  log "Applying persistent fprintd tuning profile"
+  sudo mkdir -p "$SYSTEMD_DROPIN_DIR"
+  sudo tee "$SYSTEMD_DROPIN_FILE" >/dev/null <<EOF
+[Service]
+Environment=CANVASBIO_DETECT_PROBE_MS=${DETECT_PROBE_MS}
+Environment=CANVASBIO_DETECT_RETRY_MS=${DETECT_RETRY_MS}
+EOF
+  sudo systemctl daemon-reload
+  ok "Persistent tuning applied at ${SYSTEMD_DROPIN_FILE}"
 }
 
 configure_pam_profile() {
@@ -109,6 +125,8 @@ log "Installing TOD driver and udev rule"
   sudo ninja -C build install
 )
 ok "TOD installed"
+
+apply_persistent_tuning_profile
 
 log "Reloading udev and restarting fprintd"
 sudo udevadm control --reload-rules

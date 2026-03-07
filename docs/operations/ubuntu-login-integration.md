@@ -108,6 +108,41 @@ For CLI-level diagnostics:
 RUST_LOG=debug ./target/release/canvasbio-fp wait --timeout 5
 ```
 
+Detection responsiveness tuning (TOD):
+
+- `CANVASBIO_DETECT_PROBE_MS` (default `180`, range `80..800`)
+  - Lower value: faster "finger present" reaction, but can increase false no-finger retries.
+- `CANVASBIO_DETECT_RETRY_MS` (default `35`, range `10..250`)
+  - Lower value: shorter delay between no-finger retries.
+
+Persistent defaults for this project are now:
+
+- `CANVASBIO_DETECT_PROBE_MS=170`
+- `CANVASBIO_DETECT_RETRY_MS=30`
+
+These defaults are applied automatically by:
+
+- `scripts/ops/install-ubuntu-login.sh`
+- package install (`.deb` postinst)
+
+Drop-in path:
+
+- `/etc/systemd/system/fprintd.service.d/canvasbio-tuning.conf`
+
+Temporary override for current boot/session:
+
+```bash
+sudo systemctl set-environment CANVASBIO_DETECT_PROBE_MS=140 CANVASBIO_DETECT_RETRY_MS=20
+sudo systemctl restart fprintd
+```
+
+Reset temporary override:
+
+```bash
+sudo systemctl unset-environment CANVASBIO_DETECT_PROBE_MS CANVASBIO_DETECT_RETRY_MS
+sudo systemctl restart fprintd
+```
+
 ## 7. Health Check and Rollback
 
 Health check:

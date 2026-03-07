@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRIVER_PATTERN="*tod-canvasbio*.so"
 UDEV_RULE="/usr/lib/udev/rules.d/60-libfprint-canvasbio.rules"
+SYSTEMD_DROPIN_FILE="/etc/systemd/system/fprintd.service.d/canvasbio-tuning.conf"
 
 usage() {
   cat <<USAGE
@@ -67,6 +68,14 @@ else
   warn "udev rule not present: $UDEV_RULE"
 fi
 
+if [[ -f "$SYSTEMD_DROPIN_FILE" ]]; then
+  log "Removing fprintd tuning profile: $SYSTEMD_DROPIN_FILE"
+  sudo rm -f "$SYSTEMD_DROPIN_FILE"
+  ok "Removed tuning profile"
+else
+  warn "fprintd tuning profile not present: $SYSTEMD_DROPIN_FILE"
+fi
+
 if [[ -n "$RESTORE_COMMON_AUTH" ]]; then
   if [[ -f "$RESTORE_COMMON_AUTH" ]]; then
     log "Restoring /etc/pam.d/common-auth from backup"
@@ -78,6 +87,7 @@ if [[ -n "$RESTORE_COMMON_AUTH" ]]; then
 fi
 
 log "Reloading runtime services"
+sudo systemctl daemon-reload || true
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 sudo systemctl restart fprintd || sudo pkill -9 fprintd || true
