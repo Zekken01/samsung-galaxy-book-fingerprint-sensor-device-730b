@@ -23,7 +23,7 @@ sudo apt install -y meson ninja-build pkg-config libfprint-2-dev libusb-1.0-0-de
 Preferred (automated):
 
 ```bash
-./scripts/install-ubuntu-login.sh --configure-pam
+./scripts/ops/install-ubuntu-login.sh --configure-pam
 ```
 
 Manual:
@@ -107,31 +107,31 @@ RUST_LOG=debug ./target/release/canvasbio-fp wait --timeout 5
 Health check:
 
 ```bash
-./scripts/healthcheck-ubuntu-login.sh --user "$USER"
+./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER"
 ```
 
 CI/sandbox environment check:
 
 ```bash
-./scripts/healthcheck-ubuntu-login.sh --user "$USER" --ci
+./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER" --ci
 ```
 
 Optional interactive verify during health check:
 
 ```bash
-./scripts/healthcheck-ubuntu-login.sh --user "$USER" --finger right-index-finger
+./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER" --finger right-index-finger
 ```
 
 Rollback:
 
 ```bash
-./scripts/rollback-ubuntu-login.sh
+./scripts/ops/rollback-ubuntu-login.sh
 ```
 
 If you previously changed `/etc/pam.d/common-auth` and kept a backup:
 
 ```bash
-./scripts/rollback-ubuntu-login.sh --restore-common-auth /path/to/common-auth.backup
+./scripts/ops/rollback-ubuntu-login.sh --restore-common-auth /path/to/common-auth.backup
 ```
 
 ## 8. Automated Repair Flow
@@ -139,11 +139,11 @@ If you previously changed `/etc/pam.d/common-auth` and kept a backup:
 For common failures (service state drift, stale install, PAM mismatch), run:
 
 ```bash
-./scripts/repair-ubuntu-login.sh --reinstall --configure-pam
+./scripts/ops/repair-ubuntu-login.sh --reinstall --configure-pam
 ```
 
 Optional interactive verify at the end:
 
 ```bash
-./scripts/repair-ubuntu-login.sh --reinstall --configure-pam --verify-finger right-index-finger
+./scripts/ops/repair-ubuntu-login.sh --reinstall --configure-pam --verify-finger right-index-finger
 ```

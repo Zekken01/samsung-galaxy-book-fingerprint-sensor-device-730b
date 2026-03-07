@@ -2,6 +2,24 @@
 
 Decoded from Windows driver binary analysis and USB traffic capture.
 
+## Document Context
+
+- Type: reverse engineering reference
+- Scope: protocol-level behavior (USB vendor control + SPI-over-bulk)
+- Use this with:
+  - `docs/operations/ubuntu-login-integration.md` for operational setup
+  - `docs/architecture/domain-feature-structure.md` for code-layer boundaries
+  - `docs/index.md` for full documentation index
+
+## Implementation Mapping
+
+Current code locations:
+
+- USB transport/control path: `src/domain/usb/*`
+- Sensor init/detect/capture path: `src/domain/sensor/*`
+- CLI orchestration and user-visible messages: `src/features/cli/*`
+- i18n and user feedback: `src/platform/*`
+
 ## 1. Protocol Layers
 
 The sensor communicates through three nested protocol layers:

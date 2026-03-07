@@ -2,6 +2,17 @@
 
 Initial investigation of the Samsung Galaxy Book fingerprint sensor (USB 04e8:730b) on Linux.
 
+## Document Context
+
+- Type: historical research record
+- Scope: early probing, instability observations, and hypothesis-building phase
+- Notes:
+  - Some sections capture pre-stabilization behavior and should be read as historical context.
+  - For current validated workflows, prefer:
+    - `docs/operations/ubuntu-login-integration.md`
+    - `docs/operations/fingerprint-operations.md`
+    - `docs/index.md`
+
 ## 1. Device Identification
 
 | Property | Value |

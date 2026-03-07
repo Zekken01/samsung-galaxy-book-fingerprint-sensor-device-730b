@@ -14,7 +14,7 @@ This matches the requirement: "logs stay English, only UI-visible text uses i18n
 
 Location:
 
-- `src/i18n.rs`
+- `src/platform/i18n.rs`
 
 Core model:
 
@@ -41,7 +41,7 @@ Compared to direct string branching:
 
 Location:
 
-- `src/feedback.rs`
+- `src/platform/feedback.rs`
 
 Model:
 
@@ -60,9 +60,14 @@ Entry points:
 
 Main CLI path:
 
-- `src/main.rs`
+- `src/features/cli/*`
 - wait/capture flows call feedback handlers on timeout/error
 - USB recovery retry messages are i18n-based for user display
+
+Architecture boundary:
+
+- `domain` must not import i18n/feedback directly
+- user-visible messaging belongs to `features` + `platform`
 
 ## 6. Extending to More Languages
 
@@ -76,4 +81,3 @@ For each new locale:
 Suggested guardrail:
 
 - add a unit test asserting every `Key` resolves non-empty text for all locales
-

@@ -48,7 +48,7 @@ fprintd-verify -f right-index-finger
 ```
 
 For complete Ubuntu login setup and operational runbook, see:
-[docs/ubuntu-login-integration.md](docs/ubuntu-login-integration.md)
+[docs/operations/ubuntu-login-integration.md](docs/operations/ubuntu-login-integration.md)
 
 ## Automation Scripts
 
@@ -56,53 +56,56 @@ Use the following helper scripts for repeatable install/validation/rollback:
 
 ```bash
 # Install CLI + TOD driver (+ optional PAM enable)
-./scripts/install-ubuntu-login.sh --configure-pam
+./scripts/ops/install-ubuntu-login.sh --configure-pam
 
 # Health check (device/module/fprintd/user path)
-./scripts/healthcheck-ubuntu-login.sh --user "$USER"
+./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER"
 
 # CI/sandbox-friendly check (runtime failures downgraded to WARN)
-./scripts/healthcheck-ubuntu-login.sh --user "$USER" --ci
+./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER" --ci
 
 # Roll back installed TOD artifacts
-./scripts/rollback-ubuntu-login.sh
+./scripts/ops/rollback-ubuntu-login.sh
 
 # Attempt automated repair for common runtime failures
-./scripts/repair-ubuntu-login.sh --reinstall --configure-pam
+./scripts/ops/repair-ubuntu-login.sh --reinstall --configure-pam
 ```
 
 ## Quality Gates
 
 ```bash
 # Install local pre-commit hook
-./scripts/install-git-hooks.sh
+./scripts/quality/install-git-hooks.sh
 
 # Run all gates together
-./scripts/run-quality-gates.sh
+./scripts/quality/run-quality-gates.sh
 
 # Naming conventions
-./scripts/lint-naming.sh
+./scripts/quality/lint-naming.sh
 
 # Layer dependency rules
-./scripts/lint-architecture.sh
+./scripts/quality/lint-architecture.sh
 ```
 
 CI workflow: `.github/workflows/quality-gates.yml`
 
 ## Documentation Index
 
+- [docs/index.md](docs/index.md)
+  - full documentation map and recommended read order
+
 ### Operations
 
-- [docs/ubuntu-login-integration.md](docs/ubuntu-login-integration.md)
+- [docs/operations/ubuntu-login-integration.md](docs/operations/ubuntu-login-integration.md)
   - install, enroll, verify, PAM ordering, login checks
-- [docs/fingerprint-operations.md](docs/fingerprint-operations.md)
+- [docs/operations/fingerprint-operations.md](docs/operations/fingerprint-operations.md)
   - enrollment lifecycle, template management, user guidance and feedback
 
 ### Development
 
-- [docs/i18n-feedback.md](docs/i18n-feedback.md)
+- [docs/development/i18n-feedback.md](docs/development/i18n-feedback.md)
   - key-based i18n mapper, English-fixed logs, feedback system design
-- [docs/gap-analysis.md](docs/gap-analysis.md)
+- [docs/development/gap-analysis.md](docs/development/gap-analysis.md)
   - current gaps to "production-grade Ubuntu login driver" and next milestones
 - [docs/architecture/domain-feature-structure.md](docs/architecture/domain-feature-structure.md)
   - domain/feature structure and migration rules
@@ -111,9 +114,9 @@ CI workflow: `.github/workflows/quality-gates.yml`
 
 ### Reverse Engineering / Protocol
 
-- [docs/protocol.md](docs/protocol.md) - SPI-over-USB protocol specification
-- [docs/driver-analysis.md](docs/driver-analysis.md) - Windows driver reverse engineering
-- [docs/research.md](docs/research.md) - early hardware and USB probing report
+- [docs/reverse-engineering/protocol.md](docs/reverse-engineering/protocol.md) - SPI-over-USB protocol specification
+- [docs/reverse-engineering/driver-analysis.md](docs/reverse-engineering/driver-analysis.md) - Windows driver reverse engineering
+- [docs/reverse-engineering/research.md](docs/reverse-engineering/research.md) - early hardware and USB probing report
 
 ## Hardware Summary
 

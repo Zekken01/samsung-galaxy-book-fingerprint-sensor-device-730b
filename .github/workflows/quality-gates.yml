@@ -22,7 +22,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Run quality gates
-        run: ./scripts/run-quality-gates.sh
+        run: ./scripts/quality/run-quality-gates.sh
 
       - name: Check formatting
         run: cargo fmt -- --check

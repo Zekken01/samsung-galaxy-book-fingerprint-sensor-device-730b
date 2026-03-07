@@ -11,6 +11,10 @@ login driver experience.
 - Real enrollment + verify + lock-screen unlock validated
 - User-facing i18n mapper introduced
 - Actionable CLI feedback for major runtime errors
+- Domain/feature/platform/shared source boundaries applied
+- Naming and architecture lint scripts implemented
+- CI quality gates (`cargo check`, naming lint, architecture lint, fmt check, clippy) added
+- Install/healthcheck/repair/rollback automation scripts added
 
 ## 2. Remaining Gaps
 
@@ -22,20 +26,19 @@ login driver experience.
 
 ### B. Packaging and Upgrade Safety
 
-- No distro package currently (manual build/install flow)
-- No post-install health check script
+- No distro package currently (manual/script install flow)
 - No automated rollback path when driver update fails
 
 ### C. Test Automation
 
 - Limited automated coverage for protocol + i18n key completeness + feedback mapping
-- No CI pipeline for TOD build + CLI tests on clean Ubuntu containers
+- CI exists, but hardware-in-the-loop regression is not automated yet
 
 ### D. User Experience
 
 - CLI feedback exists, but no dedicated GUI enrollment coach
 - No structured quality score surfaced to user per enrollment attempt
-- Operational guidance is docs-based, not in-app workflow
+- Operational guidance is mostly docs/script-based, not in-app workflow
 
 ### E. Upstream/Distribution Path
 
@@ -45,7 +48,7 @@ login driver experience.
 ## 3. Priority Order
 
 1. Reliability test matrix (suspend/resume, reboot cycles, repeated unlock)
-2. CI + regression tests (protocol/i18n/feedback/TOD build)
+2. Hardware-in-the-loop regression tests (real sensor + fprintd scenarios)
 3. Packaging (`.deb`) + install/rollback scripts
 4. UX enhancements (enrollment quality coaching)
 5. Upstream strategy and long-term maintenance plan
@@ -59,4 +62,3 @@ Driver can be considered production-grade when:
 - regression suite passes in CI for supported Ubuntu versions
 - localization quality is complete for supported locales
 - troubleshooting steps are deterministic and documented
-

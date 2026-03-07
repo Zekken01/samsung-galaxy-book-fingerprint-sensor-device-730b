@@ -2,6 +2,17 @@
 
 Reverse engineering results from the CanvasBio fingerprint Windows driver binaries.
 
+## Document Context
+
+- Type: reverse engineering reference
+- Scope: Windows driver binaries, architecture, recovered symbols/flows
+- Notes:
+  - This is not an operational Ubuntu setup guide.
+  - For current Linux usage and maintenance, use:
+    - `docs/operations/ubuntu-login-integration.md`
+    - `docs/operations/fingerprint-operations.md`
+    - `docs/index.md`
+
 ## 1. Driver Files
 
 ### 04E8:730B Driver (v2.4.5.882, 2023-07-25)

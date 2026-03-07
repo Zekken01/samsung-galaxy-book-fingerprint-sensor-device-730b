@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 REINSTALL=0
 CONFIGURE_PAM=0
@@ -54,9 +54,9 @@ done
 if [[ "$REINSTALL" -eq 1 ]]; then
   log "Running install workflow"
   if [[ "$CONFIGURE_PAM" -eq 1 ]]; then
-    "${REPO_ROOT}/scripts/install-ubuntu-login.sh" --configure-pam
+    "${REPO_ROOT}/scripts/ops/install-ubuntu-login.sh" --configure-pam
   else
-    "${REPO_ROOT}/scripts/install-ubuntu-login.sh"
+    "${REPO_ROOT}/scripts/ops/install-ubuntu-login.sh"
   fi
 else
   log "Reloading udev + restarting fprintd"
@@ -82,7 +82,7 @@ if [[ -z "$USER_NAME" ]]; then
 fi
 
 log "Post-repair healthcheck"
-"${REPO_ROOT}/scripts/healthcheck-ubuntu-login.sh" --user "$USER_NAME"
+"${REPO_ROOT}/scripts/ops/healthcheck-ubuntu-login.sh" --user "$USER_NAME"
 
 if [[ -n "$VERIFY_FINGER" ]]; then
   log "Interactive verification check"

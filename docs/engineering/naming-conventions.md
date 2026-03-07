@@ -70,5 +70,5 @@ Examples:
 Run:
 
 ```bash
-./scripts/lint-naming.sh
+./scripts/quality/lint-naming.sh
 ```

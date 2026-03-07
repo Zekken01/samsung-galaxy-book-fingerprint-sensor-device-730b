@@ -64,7 +64,7 @@ Not allowed:
 Enforced by script:
 
 ```bash
-./scripts/lint-architecture.sh
+./scripts/quality/lint-architecture.sh
 ```
 
 Current policy detail:
