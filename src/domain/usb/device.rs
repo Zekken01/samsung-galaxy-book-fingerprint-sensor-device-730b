@@ -26,12 +26,10 @@ impl UsbDevice {
 
         handle
             .set_active_configuration(1)
-            .or_else(|_| Ok::<_, rusb::Error>(()))?;
+            .or(Ok::<_, rusb::Error>(()))?;
         handle
             .claim_interface(0)
             .map_err(|e| usb_operation_error("claim_interface(0)", e))?;
-
-        println!("[OK] Device opened: {:04x}:{:04x}", VID, PID);
 
         Ok(Self { handle })
     }

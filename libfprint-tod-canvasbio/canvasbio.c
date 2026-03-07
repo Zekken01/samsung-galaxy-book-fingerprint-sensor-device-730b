@@ -971,6 +971,37 @@ sync_trigger_scan (int fd, GError **error)
                                NULL, NULL, error);
 }
 
+/* Fast finger probe: trigger scan and wait briefly for DA completion.
+ * Returns:
+ *   TRUE  -> scan completed quickly (finger likely present)
+ *   FALSE -> no quick completion (likely no finger)
+ * On transport error, returns FALSE and sets *error. */
+static gboolean
+sync_probe_scan_ready (int fd, guint timeout_ms, gboolean *ready, GError **error)
+{
+  if (!sync_trigger_scan (fd, error))
+    return FALSE;
+
+  guint polls = (timeout_ms / 10u);
+  if (polls == 0)
+    polls = 1;
+  for (guint i = 0; i < polls; i++)
+    {
+      guint8 da[2] = { 0, 0 };
+      if (raw_ctrl_read (fd, CY_GPIO_STATUS, 0x0007, da, 2, error) < 0)
+        return FALSE;
+      if (da[1] == 0x01)
+        {
+          *ready = TRUE;
+          return TRUE;
+        }
+      g_usleep (10000); /* 10ms */
+    }
+
+  *ready = FALSE;
+  return TRUE;
+}
+
 /* Synchronous: re-init sensor after capture.
  * Two tiers:
  *   Tier 1: clear_halt + SPI test (~50ms if SPI still alive)
@@ -1084,10 +1115,11 @@ sync_full_capture (FpDevice *dev, GError **error)
 
 /* Thread function: capture + variance-based finger detection.
  *
- * Captures a full image, checks variance to determine finger presence.
- * This MCU's SPI shift register doesn't support reliable reg 0x20 polling
- * (response lengths vary due to full-duplex SPI desync), so we use
- * capture + variance instead.
+ * Hybrid strategy:
+ * 1) Fast DA probe (scan-complete within short timeout) to skip expensive
+ *    work when no finger is present.
+ * 2) If probe indicates likely finger, capture full image and run variance
+ *    check for robust confirmation.
  *
  * Returns TRUE (finger found, image in img_buf) or FALSE (no finger).
  */
@@ -1107,6 +1139,30 @@ detect_thread_func (GTask *task, gpointer source_object,
       g_task_return_error (task, error);
       return;
     }
+
+  /* Fast path: if scan does not complete quickly, treat as no finger
+   * and avoid full image transfer + USB reset cycle. */
+  {
+    gboolean ready = FALSE;
+    if (!sync_probe_scan_ready (self->raw_usb_fd, 400, &ready, &error))
+      {
+        fp_warn ("Detect probe failed: %s", error->message);
+        g_clear_error (&error);
+        GError *re = NULL;
+        if (!sync_reinit_sensor (self, &re))
+          fp_warn ("Post-probe reinit: %s (non-fatal)", re->message);
+        g_clear_error (&re);
+        g_task_return_boolean (task, FALSE);
+        return;
+      }
+
+    if (!ready)
+      {
+        /* No finger: return quickly without full capture. */
+        g_task_return_boolean (task, FALSE);
+        return;
+      }
+  }
 
   if (!sync_full_capture (dev, &error))
     {

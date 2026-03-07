@@ -4,9 +4,9 @@ mod init;
 
 pub use capture::SensorCapture;
 pub use detect::{FingerDetect, WAIT_TIMEOUT};
-pub use init::SensorInit;
+pub use init::{SensorInfo, SensorInit};
 
-use crate::usb::UsbDevice;
+use crate::domain::usb::UsbDevice;
 
 pub struct CanvasBioDevice {
     pub(crate) usb: UsbDevice,

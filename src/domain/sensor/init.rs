@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::time::Duration;
 
 use super::CanvasBioDevice;
-use crate::usb::transfer::*;
-use crate::usb::{BulkTransfer, CypressControl};
+use crate::domain::usb::transfer::*;
+use crate::domain::usb::{BulkTransfer, CypressControl};
 
 // Sensor configuration registers (from Windows driver capture)
 const INIT_REGISTERS: &[(u8, u16)] = &[
@@ -26,9 +26,19 @@ const INIT_REGISTERS: &[(u8, u16)] = &[
     (0x52, 0x2700), // Image parameter
 ];
 
+pub struct SensorInfo {
+    pub cypress_magic: [u8; 4],
+    pub firmware_major: u8,
+    pub firmware_minor: u8,
+    pub firmware_patch: u8,
+    pub firmware_mode: char,
+    pub build: u32,
+    pub ready: bool,
+}
+
 /// SPI register write/read helpers and initialization.
 pub trait SensorInit {
-    fn print_info(&self) -> Result<()>;
+    fn read_info(&self) -> Result<SensorInfo>;
     fn initialize(&mut self) -> Result<()>;
     fn spi_write_reg(&self, reg: u8, val: u8) -> Result<()>;
     fn spi_write_reg2(&self, reg: u8, val: u16) -> Result<()>;
@@ -71,33 +81,25 @@ impl SensorInit for CanvasBioDevice {
         Ok(buf[..n].to_vec())
     }
 
-    fn print_info(&self) -> Result<()> {
-        let mut buf = [0u8; 4];
-        self.usb.cy_vendor_read(0xBD, &mut buf)?;
-        println!(
-            "  Cypress MCU: {} ({:02x?})",
-            String::from_utf8_lossy(&buf),
-            buf
-        );
-
+    fn read_info(&self) -> Result<SensorInfo> {
+        let mut cypress_magic = [0u8; 4];
+        self.usb.cy_vendor_read(0xBD, &mut cypress_magic)?;
         let mut ver = [0u8; 8];
         self.usb.cy_vendor_read(0xB0, &mut ver)?;
-        println!(
-            "  Firmware: v{}.{}.{}, mode='{}'",
-            ver[0], ver[1], ver[2], ver[4] as char
-        );
-
         let mut build = [0u8; 4];
         self.usb.cy_vendor_read(0xB1, &mut build)?;
-        println!("  Build: {}", u32::from_le_bytes(build));
-
-        println!("  Ready: {}", self.usb.spi_check_ready()?);
-        Ok(())
+        Ok(SensorInfo {
+            cypress_magic,
+            firmware_major: ver[0],
+            firmware_minor: ver[1],
+            firmware_patch: ver[2],
+            firmware_mode: ver[4] as char,
+            build: u32::from_le_bytes(build),
+            ready: self.usb.spi_check_ready()? != 0,
+        })
     }
 
     fn initialize(&mut self) -> Result<()> {
-        println!("[*] Initializing sensor...");
-
         // Step 1: Cypress power init
         log::debug!("Power init");
         for &idx in &[1u16, 0, 1] {
@@ -118,7 +120,7 @@ impl SensorInit for CanvasBioDevice {
 
         // Step 4: Read Hardware ID
         let hw_id = self.spi_read_reg(0xB9)?;
-        println!("  Hardware ID: 0x{:02X}", hw_id);
+        log::debug!("Hardware ID: 0x{:02X}", hw_id);
 
         // Step 5: Sensor configuration
         log::debug!("Writing init registers");
@@ -127,7 +129,6 @@ impl SensorInit for CanvasBioDevice {
         }
 
         self.initialized = true;
-        println!("[OK] Sensor initialized");
         Ok(())
     }
 }

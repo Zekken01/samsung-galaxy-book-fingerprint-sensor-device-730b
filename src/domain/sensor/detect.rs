@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::init::SensorInit;
 use super::CanvasBioDevice;
-use crate::usb::error::{classify_usb_error, is_retryable_usb_error};
+use crate::domain::usb::error::{classify_usb_error, is_retryable_usb_error};
 
 /// Polling interval for finger-down detection loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(15);
@@ -88,7 +88,7 @@ impl CanvasBioDevice {
     }
 
     fn wait_finger_down_via_scan_probe(&self, timeout: Duration) -> Result<bool> {
-        println!("[*] Falling back to scan-complete finger detection...");
+        log::debug!("Falling back to scan-complete finger detection");
         let start = Instant::now();
         loop {
             let elapsed = start.elapsed();
@@ -107,7 +107,6 @@ impl CanvasBioDevice {
 
             let probe_timeout = std::cmp::min(remaining, FALLBACK_PROBE_MAX);
             if self.probe_finger_via_scan_complete(probe_timeout)? {
-                println!("[OK] Finger detected!");
                 return Ok(true);
             }
 
@@ -139,8 +138,6 @@ impl FingerDetect for CanvasBioDevice {
 
     fn wait_finger_down(&self, timeout: Duration) -> Result<bool> {
         self.set_mode_finger_down()?;
-
-        println!("[*] Waiting for finger...");
         let start = Instant::now();
 
         loop {
@@ -167,7 +164,6 @@ impl FingerDetect for CanvasBioDevice {
             };
 
             if status == STATUS_FINGER_DOWN {
-                println!("[OK] Finger detected!");
                 return Ok(true);
             }
 

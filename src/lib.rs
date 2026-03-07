@@ -1,3 +1,4 @@
-pub mod image;
-pub mod sensor;
-pub mod usb;
+pub mod domain;
+pub mod features;
+pub mod platform;
+pub mod shared;

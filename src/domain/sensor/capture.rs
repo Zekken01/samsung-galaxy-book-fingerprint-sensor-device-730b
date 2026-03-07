@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use super::init::SensorInit;
 use super::CanvasBioDevice;
-use crate::usb::transfer::*;
-use crate::usb::{BulkTransfer, CypressControl};
+use crate::domain::usb::transfer::*;
+use crate::domain::usb::{BulkTransfer, CypressControl};
 
 pub const IMG_WIDTH: u32 = 112;
 pub const IMG_HEIGHT: u32 = 96;
@@ -126,12 +126,10 @@ impl SensorCapture for CanvasBioDevice {
         // NOTE: Without a finger on the sensor, the scan never completes
         // (DA stays [0x00, 0x00]).  In that case we proceed to readout
         // anyway — the sensor buffer will contain a blank/dark image.
-        println!("  Waiting for sensor scan...");
         match self.usb.poll_scan_complete(TIMEOUT_SCAN) {
             Ok(()) => {}
             Err(e) => {
                 log::warn!("Scan poll: {} — proceeding with readout", e);
-                println!("  Scan timeout (no finger?), reading anyway...");
             }
         }
 
@@ -195,8 +193,8 @@ impl SensorCapture for CanvasBioDevice {
             image.resize(IMG_SIZE, 0);
         }
 
-        println!(
-            "  Image captured: {}x{} ({} bytes), transfer: {:.0}ms",
+        log::debug!(
+            "Image captured: {}x{} ({} bytes), transfer: {:.0}ms",
             IMG_WIDTH,
             IMG_HEIGHT,
             image.len(),
