@@ -30,7 +30,8 @@ jobs:
             libusb-1.0-0-dev \
             libglib2.0-dev \
             libgusb-dev \
-            libfprint-2-dev
+            libfprint-2-dev \
+            libfprint-2-tod-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

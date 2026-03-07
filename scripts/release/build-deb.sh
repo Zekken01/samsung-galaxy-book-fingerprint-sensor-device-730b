@@ -100,7 +100,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Choi Won <help@myso.kr>
-Depends: libusb-1.0-0
+Depends: libusb-1.0-0, libfprint-2-tod1, fprintd
 Description: CanvasBio fingerprint driver and TOD plugin for Samsung Galaxy Book
  Includes CLI tools and libfprint TOD plugin artifacts for USB 04e8:730b.
 CONTROL
