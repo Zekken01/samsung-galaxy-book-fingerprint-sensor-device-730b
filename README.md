@@ -102,6 +102,17 @@ For Ubuntu distribution, build a `.deb` package:
 
 Note: `.dmg` is a macOS format and is not used for Ubuntu deployment.
 
+### Automatic Release
+
+Tag push (`v*`) triggers automatic `.deb` build and GitHub Release upload:
+
+```bash
+git tag -a v0.2.1 -m "Release v0.2.1"
+git push origin v0.2.1
+```
+
+Workflow: `.github/workflows/release-deb.yml`
+
 ## Documentation Index
 
 - [docs/index.md](docs/index.md)
