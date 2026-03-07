@@ -5,15 +5,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TOD_DIR="${REPO_ROOT}/libfprint-tod-canvasbio"
 CONFIGURE_PAM=0
+CONFIGURE_PAM_FORCE=0
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") [--configure-pam]
+Usage: $(basename "$0") [--configure-pam] [--configure-pam-force]
 
 Installs CanvasBio TOD driver and reloads fprintd services.
 
 Options:
-  --configure-pam   Enable fprintd via pam-auth-update after install
+  --configure-pam         Enable fprintd via pam-auth-update after install
+  --configure-pam-force   Force non-interactive PAM update (uses --force)
   -h, --help        Show this help
 USAGE
 }
@@ -29,10 +31,43 @@ require_cmd() {
   fi
 }
 
+configure_pam_profile() {
+  if ! command -v pam-auth-update >/dev/null 2>&1; then
+    warn "pam-auth-update not found; skip PAM auto-configuration"
+    return 0
+  fi
+
+  log "Enabling fprintd PAM profile"
+  if [[ "$CONFIGURE_PAM_FORCE" -eq 1 ]]; then
+    if sudo DEBIAN_FRONTEND=noninteractive pam-auth-update --enable fprintd --force; then
+      ok "PAM profile updated (forced non-interactive)"
+      return 0
+    fi
+    warn "Forced PAM update failed"
+    return 1
+  fi
+
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    if sudo pam-auth-update --enable fprintd; then
+      ok "PAM profile updated"
+      return 0
+    fi
+    warn "Interactive PAM update failed"
+    return 1
+  fi
+
+  warn "Non-interactive environment detected; retry with --configure-pam-force"
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --configure-pam)
       CONFIGURE_PAM=1
+      ;;
+    --configure-pam-force)
+      CONFIGURE_PAM=1
+      CONFIGURE_PAM_FORCE=1
       ;;
     -h|--help)
       usage
@@ -82,13 +117,7 @@ sudo systemctl restart fprintd || sudo pkill -9 fprintd || true
 ok "Runtime services reloaded"
 
 if [[ "$CONFIGURE_PAM" -eq 1 ]]; then
-  if command -v pam-auth-update >/dev/null 2>&1; then
-    log "Enabling fprintd PAM profile"
-    sudo pam-auth-update --enable fprintd
-    ok "PAM profile updated"
-  else
-    warn "pam-auth-update not found; skip PAM auto-configuration"
-  fi
+  configure_pam_profile || true
 fi
 
 cat <<NEXT

@@ -58,6 +58,9 @@ Use the following helper scripts for repeatable install/validation/rollback:
 # Install CLI + TOD driver (+ optional PAM enable)
 ./scripts/ops/install-ubuntu-login.sh --configure-pam
 
+# Non-interactive/CI-safe PAM update
+./scripts/ops/install-ubuntu-login.sh --configure-pam-force
+
 # Health check (device/module/fprintd/user path)
 ./scripts/ops/healthcheck-ubuntu-login.sh --user "$USER"
 
@@ -88,6 +91,16 @@ Use the following helper scripts for repeatable install/validation/rollback:
 ```
 
 CI workflow: `.github/workflows/quality-gates.yml`
+
+## Release Packaging
+
+For Ubuntu distribution, build a `.deb` package:
+
+```bash
+./scripts/release/build-deb.sh
+```
+
+Note: `.dmg` is a macOS format and is not used for Ubuntu deployment.
 
 ## Documentation Index
 

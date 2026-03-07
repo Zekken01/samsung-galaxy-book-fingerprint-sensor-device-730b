@@ -26,6 +26,12 @@ Preferred (automated):
 ./scripts/ops/install-ubuntu-login.sh --configure-pam
 ```
 
+Non-interactive/CI-safe PAM update:
+
+```bash
+./scripts/ops/install-ubuntu-login.sh --configure-pam-force
+```
+
 Manual:
 
 ```bash
@@ -147,3 +153,15 @@ Optional interactive verify at the end:
 ```bash
 ./scripts/ops/repair-ubuntu-login.sh --reinstall --configure-pam --verify-finger right-index-finger
 ```
+
+## 9. Ubuntu Release Artifact
+
+Build a Debian package:
+
+```bash
+./scripts/release/build-deb.sh
+```
+
+Output:
+
+- `dist/canvasbio-fp_<version>_<arch>.deb`

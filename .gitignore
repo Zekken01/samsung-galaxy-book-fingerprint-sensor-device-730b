@@ -1,4 +1,5 @@
 /target
+/dist
 
 # Binary capture data (too large for git)
 captures/
