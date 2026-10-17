@@ -15,3 +15,9 @@ libfprint-tod-canvasbio/build/
 .vscode/
 .idea/
 *.swp
+
+# Built dev tools
+tools/cb-tool
+tools/cb-eval
+tools/cb-match-eval
+tools/*.o

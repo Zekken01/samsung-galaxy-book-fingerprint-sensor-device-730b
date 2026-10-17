@@ -134,36 +134,17 @@ static const RegEntry detect_poll_registers[] = {
 typedef struct _FpiDeviceCanvasbio FpiDeviceCanvasbio;
 
 struct _FpiDeviceCanvasbio {
-  FpImageDevice parent;
+  FpDevice parent;
 
   gboolean initialized;
 
-  /* Register sequence state */
-  gint          reg_idx;
-  const RegEntry *reg_table;
-  gint          reg_table_len;
-
-  /* SPI result buffer (for reads) */
-  guint8  spi_result[64];
-  gsize   spi_result_len;
-
-  /* Image buffer */
+  /* Last captured frame (bit-corrected raw pixels) */
   guint8  img_buf[IMG_SIZE];
   gsize   img_offset;
-  gint    bulk_block;
 
-  /* DA poll counter */
-  gint    poll_timeout_counter;
+  /* Feature blobs (GBytes) of the enroll touches collected so far */
+  GPtrArray *enroll_feats;
 
-  /* Detect poll timer */
-  GSource *poll_source;
-
-  /* Timestamp when scan was triggered (for stale DA detection) */
-  gint64  scan_trigger_time;
-
-  /* Pre-captured image flag (image captured in detect phase) */
-  gboolean image_ready;
-
-  /* Raw USB fd for bulk transfers (bypasses GUsb nested main loop issue) */
+  /* Raw USB fd for all transfers (bypasses GUsb nested main loop issue) */
   int raw_usb_fd;
 };

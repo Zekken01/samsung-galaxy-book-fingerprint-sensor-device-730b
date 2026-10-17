@@ -13,6 +13,43 @@ Working end-to-end on Ubuntu:
 - i18n mapper for user-facing CLI output (multi-language, English fallback)
 - Actionable runtime feedback for timeout/USB error classes
 
+## Fork Changes: Capture Fixes and New Matcher
+
+The original TOD plugin accepted other people's fingers and rarely matched the
+enrolled one. Investigation with real captures found three causes:
+
+1. **1-bit SPI shift.** Every byte read over SPI arrives shifted left one bit
+   (the HW ID `0x34` reads as `0x68`; register `0x60 = 0x1B` reads as `0x36`).
+   In images this wrapped bright pixels to dark and drew false edges inside
+   every ridge. The driver now undoes the shift exactly:
+   `px[i] = (raw[i] >> 1) | ((raw[i-1] & 1) << 7)`.
+2. **Misaligned bulk transfer.** Block 0 is 259 bytes, so its last 3 bytes
+   arrive late as a short packet. Copying reads into fixed 256-byte slots
+   shifted rows sideways and dropped the image tail. Reads are now appended
+   in order and the lagging tail is collected at the end.
+3. **NBIS can't work on this sensor.** The 112x96 window (~5x4 mm) holds only
+   3-6 real minutiae, so bozorth3 scores were noise at any scale or threshold.
+   The driver is now a plain `FpDevice` that matches ridge texture with
+   OpenCV SIFT + RANSAC (`cb-match.cpp`), 12 enroll touches, threshold 12
+   inliers (`CANVASBIO_MATCH_THRESHOLD` overrides it).
+
+Offline, on 40 captures from 4 fingers: impostor probes scored at most 5
+inliers (0 accepted of 120), genuine probes a median of 33-43.
+
+**Prints enrolled with the old driver must be re-enrolled**
+(`fprintd-delete $USER`, then `fprintd-enroll`).
+
+Development tools in `tools/` (build with `tools/build.sh`):
+
+- `cb-tool snap|sweep|capture`: talk to the sensor directly (no fprintd) to
+  grab raw frames or labelled datasets.
+- `cb-match-eval <dir> [stages] [threshold]`: genuine/impostor scores of the
+  driver's matcher on a dataset of `<finger>_<n>.pgm` files.
+- `cb-eval <dir>`: the same for libfprint's NBIS path, at several scales.
+
+Set `CANVASBIO_DUMP_DIR=/some/dir` in fprintd's environment to save each
+captured raw frame for building such datasets.
+
 ## Quick Start
 
 ### 1) Build CLI
@@ -33,6 +70,8 @@ sudo ./target/release/canvasbio-fp capture --wait -o fingerprint.png
 ### 3) Build/Install libfprint TOD Driver
 
 ```bash
+sudo apt install -y meson ninja-build libfprint-2-tod-dev libgusb-dev \
+  libopencv-features2d-dev libopencv-calib3d-dev libopencv-imgproc-dev
 cd libfprint-tod-canvasbio
 meson setup build
 ninja -C build

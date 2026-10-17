@@ -1,2 +1,0 @@
-option('debug_images', type: 'boolean', value: false,
-  description: 'Dump captured images as PGM files to /tmp/')

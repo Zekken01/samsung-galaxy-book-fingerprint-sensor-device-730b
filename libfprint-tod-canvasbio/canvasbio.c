@@ -8,398 +8,14 @@
 #include <linux/usbdevice_fs.h>
 #include <drivers_api.h>
 #include "canvasbio.h"
+#include "cb-match.h"
 
-/* CLAHE (Contrast Limited Adaptive Histogram Equalization).
- * Divides image into tiles, computes clipped histograms per tile,
- * then bilinear-interpolates CDF mappings to avoid block artifacts.
- * Operates in-place on buf. */
-static void
-cb_clahe (guint8 *buf, int width, int height,
-          int tile_w, int tile_h, gdouble clip_limit)
-{
-  int nx = width / tile_w;   /* number of tiles horizontally */
-  int ny = height / tile_h;  /* number of tiles vertically */
-
-  if (nx < 1 || ny < 1)
-    return;
-
-  int tile_pixels = tile_w * tile_h;
-  int clip_count = (int)(clip_limit * tile_pixels / 256);
-  if (clip_count < 1)
-    clip_count = 1;
-
-  /* Allocate CDF LUTs for all tiles: nx * ny * 256 bytes */
-  guint8 *cdfs = g_malloc0 ((gsize) nx * ny * 256);
-
-  /* Build per-tile CDF */
-  for (int ty = 0; ty < ny; ty++)
-    {
-      for (int tx = 0; tx < nx; tx++)
-        {
-          int hist[256] = { 0 };
-          int y0 = ty * tile_h;
-          int x0 = tx * tile_w;
-
-          /* Compute histogram for this tile */
-          for (int y = y0; y < y0 + tile_h; y++)
-            for (int x = x0; x < x0 + tile_w; x++)
-              hist[buf[y * width + x]]++;
-
-          /* Clip histogram and redistribute excess */
-          int excess = 0;
-          for (int i = 0; i < 256; i++)
-            {
-              if (hist[i] > clip_count)
-                {
-                  excess += hist[i] - clip_count;
-                  hist[i] = clip_count;
-                }
-            }
-          int bonus = excess / 256;
-          int residual = excess - bonus * 256;
-          for (int i = 0; i < 256; i++)
-            hist[i] += bonus;
-          /* Spread residual evenly across bins */
-          for (int i = 0; i < residual; i++)
-            hist[(int)((gint64) i * 256 / residual)]++;
-
-          /* Compute CDF and normalize to 0-255 */
-          int cdf = 0;
-          guint8 *lut = cdfs + ((gsize) ty * nx + tx) * 256;
-          for (int i = 0; i < 256; i++)
-            {
-              cdf += hist[i];
-              lut[i] = (guint8) CLAMP ((int)((gdouble) cdf * 255 / tile_pixels + 0.5), 0, 255);
-            }
-        }
-    }
-
-  /* Apply CLAHE with bilinear interpolation between tile CDFs */
-  for (int y = 0; y < height; y++)
-    {
-      /* Map pixel to tile-center coordinates */
-      gdouble gy = ((gdouble) y - (gdouble) tile_h / 2.0) / tile_h;
-      int ty0 = (int) gy;
-      int ty1 = ty0 + 1;
-      gdouble fy = gy - ty0;
-
-      if (ty0 < 0) { ty0 = 0; fy = 0.0; }
-      if (ty1 >= ny) { ty1 = ny - 1; fy = 1.0; if (ty0 >= ny) ty0 = ny - 1; }
-      if (ty0 == ty1) fy = 0.0;
-
-      for (int x = 0; x < width; x++)
-        {
-          gdouble gx = ((gdouble) x - (gdouble) tile_w / 2.0) / tile_w;
-          int tx0 = (int) gx;
-          int tx1 = tx0 + 1;
-          gdouble fx = gx - tx0;
-
-          if (tx0 < 0) { tx0 = 0; fx = 0.0; }
-          if (tx1 >= nx) { tx1 = nx - 1; fx = 1.0; if (tx0 >= nx) tx0 = nx - 1; }
-          if (tx0 == tx1) fx = 0.0;
-
-          guint8 val = buf[y * width + x];
-
-          /* Bilinear interpolation of 4 surrounding tile CDFs */
-          guint8 *lut_tl = cdfs + ((gsize) ty0 * nx + tx0) * 256;
-          guint8 *lut_tr = cdfs + ((gsize) ty0 * nx + tx1) * 256;
-          guint8 *lut_bl = cdfs + ((gsize) ty1 * nx + tx0) * 256;
-          guint8 *lut_br = cdfs + ((gsize) ty1 * nx + tx1) * 256;
-
-          gdouble v = (1.0 - fx) * (1.0 - fy) * lut_tl[val]
-                    + fx         * (1.0 - fy) * lut_tr[val]
-                    + (1.0 - fx) * fy         * lut_bl[val]
-                    + fx         * fy         * lut_br[val];
-
-          buf[y * width + x] = (guint8) CLAMP ((int)(v + 0.5), 0, 255);
-        }
-    }
-
-  g_free (cdfs);
-}
-
-/* Bicubic interpolation kernel (Catmull-Rom, a = -0.5).
- * w(t) = (a+2)|t|^3 - (a+3)|t|^2 + 1          for |t| <= 1
- *       = a|t|^3 - 5a|t|^2 + 8a|t| - 4a        for 1 < |t| < 2
- *       = 0                                      otherwise */
-static inline gdouble
-bicubic_weight (gdouble t)
-{
-  const gdouble a = -0.5;
-  gdouble at = (t < 0) ? -t : t;
-
-  if (at <= 1.0)
-    return (a + 2.0) * at * at * at - (a + 3.0) * at * at + 1.0;
-  else if (at < 2.0)
-    return a * at * at * at - 5.0 * a * at * at + 8.0 * a * at - 4.0 * a;
-  else
-    return 0.0;
-}
-
-/* Bicubic upscale: src (sw x sh) → dst (sw*scale x sh*scale).
- * Samples a 4x4 neighborhood for each output pixel using Catmull-Rom. */
-static void
-cb_bicubic_upscale (const guint8 *src, int sw, int sh,
-                    guint8 *dst, int scale)
-{
-  int dw = sw * scale;
-  int dh = sh * scale;
-
-  for (int dy = 0; dy < dh; dy++)
-    {
-      gdouble sy = ((gdouble) dy + 0.5) / scale - 0.5;
-      int iy = (int) floor (sy);
-      gdouble fy = sy - iy;
-
-      for (int dx = 0; dx < dw; dx++)
-        {
-          gdouble sx = ((gdouble) dx + 0.5) / scale - 0.5;
-          int ix = (int) floor (sx);
-          gdouble fx = sx - ix;
-
-          gdouble val = 0.0;
-
-          for (int m = -1; m <= 2; m++)
-            {
-              gdouble wy = bicubic_weight (fy - m);
-              int yy = iy + m;
-              if (yy < 0) yy = 0;
-              if (yy >= sh) yy = sh - 1;
-
-              for (int n = -1; n <= 2; n++)
-                {
-                  gdouble wx = bicubic_weight (fx - n);
-                  int xx = ix + n;
-                  if (xx < 0) xx = 0;
-                  if (xx >= sw) xx = sw - 1;
-
-                  val += wy * wx * src[yy * sw + xx];
-                }
-            }
-
-          dst[dy * dw + dx] = (guint8) CLAMP ((int)(val + 0.5), 0, 255);
-        }
-    }
-}
-
-G_DECLARE_FINAL_TYPE (FpiDeviceCanvasbio, fpi_device_canvasbio, FPI, DEVICE_CANVASBIO, FpImageDevice)
-G_DEFINE_TYPE (FpiDeviceCanvasbio, fpi_device_canvasbio, FP_TYPE_IMAGE_DEVICE)
+G_DECLARE_FINAL_TYPE (FpiDeviceCanvasbio, fpi_device_canvasbio, FPI, DEVICE_CANVASBIO, FpDevice)
+G_DEFINE_TYPE (FpiDeviceCanvasbio, fpi_device_canvasbio, FP_TYPE_DEVICE)
 
 static const FpIdEntry id_table[] = {
   { .vid = 0x04E8, .pid = 0x730B },
   { .vid = 0, .pid = 0 },
-};
-
-/* ========================================================================
- * USB Helper Functions
- * ======================================================================== */
-
-static void
-cb_vendor_write (FpiSsm *ssm, FpDevice *dev,
-                 guint8 request, guint16 value, guint16 index)
-{
-  FpiUsbTransfer *xfer = fpi_usb_transfer_new (dev);
-
-  fpi_usb_transfer_fill_control (xfer,
-                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
-                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                 G_USB_DEVICE_RECIPIENT_DEVICE,
-                                 request, value, index, 0);
-  xfer->ssm = ssm;
-  fpi_usb_transfer_submit (xfer, TIMEOUT_CMD, NULL,
-                           fpi_ssm_usb_transfer_cb, NULL);
-}
-
-static void
-cb_vendor_read (FpiSsm *ssm, FpDevice *dev,
-                guint8 request, guint16 value,
-                gsize len, FpiUsbTransferCallback callback)
-{
-  FpiUsbTransfer *xfer = fpi_usb_transfer_new (dev);
-
-  fpi_usb_transfer_fill_control (xfer,
-                                 G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
-                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                 G_USB_DEVICE_RECIPIENT_DEVICE,
-                                 request, value, 0, len);
-  xfer->ssm = ssm;
-  fpi_usb_transfer_submit (xfer, TIMEOUT_CMD, NULL, callback, NULL);
-}
-
-static void
-cb_bulk_write (FpiSsm *ssm, FpDevice *dev,
-               const guint8 *data, gsize len)
-{
-  FpiUsbTransfer *xfer = fpi_usb_transfer_new (dev);
-
-  /* Allocate transfer-owned buffer and copy data into it.
-   * Cannot use fill_bulk_full with stack-local data because the
-   * async transfer outlives the caller's stack frame. */
-  fpi_usb_transfer_fill_bulk (xfer, CB_EP_OUT, len);
-  memcpy (xfer->buffer, data, len);
-  xfer->ssm = ssm;
-  fpi_usb_transfer_submit (xfer, TIMEOUT_CMD, NULL,
-                           fpi_ssm_usb_transfer_cb, NULL);
-}
-
-static void
-cb_bulk_read (FpiSsm *ssm, FpDevice *dev,
-              gsize len, guint timeout_ms,
-              FpiUsbTransferCallback callback)
-{
-  FpiUsbTransfer *xfer = fpi_usb_transfer_new (dev);
-
-  fpi_usb_transfer_fill_bulk (xfer, CB_EP_IN, len);
-  xfer->ssm = ssm;
-  fpi_usb_transfer_submit (xfer, timeout_ms, NULL, callback, NULL);
-}
-
-/* ========================================================================
- * Generic Register Sequence Sub-SSM
- *
- * Walks a RegEntry table. Each entry takes 3 states:
- *   PREPARE (CA vendor write) -> BULK_OUT (SPI cmd) -> COMPLETE (CC or bulk IN)
- * ======================================================================== */
-
-enum {
-  REG_SEQ_PREPARE,
-  REG_SEQ_BULK_OUT,
-  REG_SEQ_COMPLETE,
-  REG_SEQ_NUM_STATES,
-};
-
-static void reg_seq_complete_cb (FpiUsbTransfer *xfer, FpDevice *dev,
-                                 gpointer user_data, GError *error);
-
-static void
-reg_seq_run (FpiSsm *ssm, FpDevice *dev)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  int state = fpi_ssm_get_cur_state (ssm);
-
-  if (self->reg_idx >= self->reg_table_len)
-    {
-      fpi_ssm_mark_completed (ssm);
-      return;
-    }
-
-  const RegEntry *e = &self->reg_table[self->reg_idx];
-
-  switch (state)
-    {
-    case REG_SEQ_PREPARE:
-      {
-        guint16 direction, size;
-        if (e->op == REG_READ || e->op == REG_READ_FULL)
-          {
-            direction = SPI_DIR_READ;
-            size = 3;
-          }
-        else if (e->op == REG_WRITE1)
-          {
-            direction = SPI_DIR_WRITE;
-            size = 3;
-          }
-        else /* REG_WRITE2 */
-          {
-            direction = SPI_DIR_WRITE;
-            size = 4;
-          }
-        cb_vendor_write (ssm, dev, CY_SPI_TRANSFER, direction, size);
-        break;
-      }
-
-    case REG_SEQ_BULK_OUT:
-      {
-        if (e->op == REG_READ || e->op == REG_READ_FULL)
-          {
-            guint8 cmd[3] = { SPI_READ_CMD, e->reg, 0x00 };
-            cb_bulk_write (ssm, dev, cmd, 3);
-          }
-        else if (e->op == REG_WRITE1)
-          {
-            guint8 cmd[3] = { SPI_WRITE_CMD, e->reg, (guint8)(e->val & 0xFF) };
-            cb_bulk_write (ssm, dev, cmd, 3);
-          }
-        else /* REG_WRITE2 */
-          {
-            guint8 cmd[4] = { SPI_WRITE_CMD, e->reg,
-                              (guint8)(e->val >> 8), (guint8)(e->val & 0xFF) };
-            cb_bulk_write (ssm, dev, cmd, 4);
-          }
-        break;
-      }
-
-    case REG_SEQ_COMPLETE:
-      {
-        if (e->op == REG_READ || e->op == REG_READ_FULL)
-          {
-            /* Read response via bulk IN */
-            cb_bulk_read (ssm, dev, 64, TIMEOUT_CMD, reg_seq_complete_cb);
-          }
-        else
-          {
-            /* Check SPI ready via CC vendor read */
-            cb_vendor_read (ssm, dev, CY_READY_CHECK, 0, 4, reg_seq_complete_cb);
-          }
-        break;
-      }
-    }
-}
-
-static void
-reg_seq_complete_cb (FpiUsbTransfer *xfer, FpDevice *dev,
-                     gpointer user_data, GError *error)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-
-  if (error)
-    {
-      const RegEntry *e = &self->reg_table[self->reg_idx];
-      fp_warn ("reg_seq error at idx=%d op=%d reg=0x%02X: %s",
-               self->reg_idx, e->op, e->reg, error->message);
-      fpi_ssm_mark_failed (xfer->ssm, error);
-      return;
-    }
-
-  const RegEntry *e = &self->reg_table[self->reg_idx];
-
-  if (e->op == REG_READ || e->op == REG_READ_FULL)
-    {
-      self->spi_result_len = MIN ((gsize) xfer->actual_length, sizeof (self->spi_result));
-      memcpy (self->spi_result, xfer->buffer, self->spi_result_len);
-    }
-
-  self->reg_idx++;
-  if (self->reg_idx < self->reg_table_len)
-    fpi_ssm_jump_to_state (xfer->ssm, REG_SEQ_PREPARE);
-  else
-    fpi_ssm_mark_completed (xfer->ssm);
-}
-
-static FpiSsm *
-reg_seq_ssm_new (FpDevice *dev, const RegEntry *table, gint len)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-
-  self->reg_idx = 0;
-  self->reg_table = table;
-  self->reg_table_len = len;
-
-  FpiSsm *ssm = fpi_ssm_new (dev, reg_seq_run, REG_SEQ_NUM_STATES);
-  return ssm;
-}
-
-/* ========================================================================
- * Init (dev_open) SSM
- *
- * Power-on and SPI enable are done synchronously in dev_open (matching
- * the Rust driver). Only the 17 register writes use the async SSM.
- * ======================================================================== */
-
-enum {
-  INIT_WRITE_REGS,
-  INIT_NUM_STATES,
 };
 
 
@@ -701,36 +317,7 @@ sync_init_early (int fd, GError **error)
 }
 
 static void
-init_run (FpiSsm *ssm, FpDevice *dev)
-{
-  switch (fpi_ssm_get_cur_state (ssm))
-    {
-    case INIT_WRITE_REGS:
-      {
-        /* All init done synchronously in sync_init_early now */
-        fpi_ssm_mark_completed (ssm);
-        break;
-      }
-    }
-}
-
-static void
-init_done (FpiSsm *ssm, FpDevice *dev, GError *error)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
-
-  if (!error)
-    {
-      self->initialized = TRUE;
-      fp_dbg ("Sensor initialized successfully");
-    }
-
-  fpi_image_device_open_complete (img_dev, error);
-}
-
-static void
-dev_open (FpImageDevice *dev)
+dev_open (FpDevice *dev)
 {
   FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
   GUsbDevice *usb_dev = fpi_device_get_usb_device (FP_DEVICE (dev));
@@ -759,7 +346,7 @@ dev_open (FpImageDevice *dev)
                                      G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER,
                                      &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
@@ -768,7 +355,7 @@ dev_open (FpImageDevice *dev)
    * release/claim dance that breaks second captures. */
   if (!g_usb_device_release_interface (usb_dev, 0, 0, &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
@@ -784,7 +371,7 @@ dev_open (FpImageDevice *dev)
       g_set_error (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
                     "Failed to open %s: %s", usb_path, g_strerror (errno));
       g_usb_device_claim_interface (usb_dev, 0, 0, NULL);
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
@@ -796,7 +383,7 @@ dev_open (FpImageDevice *dev)
       close (self->raw_usb_fd);
       self->raw_usb_fd = -1;
       g_usb_device_claim_interface (usb_dev, 0, 0, NULL);
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
@@ -812,17 +399,16 @@ dev_open (FpImageDevice *dev)
       g_usb_device_claim_interface (usb_dev, 0,
                                      G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER,
                                      NULL);
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
-  /* Async SSM for register writes (currently a no-op, init done above) */
-  FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), init_run, INIT_NUM_STATES);
-  fpi_ssm_start (ssm, init_done);
+  self->initialized = TRUE;
+  fpi_device_open_complete (dev, NULL);
 }
 
 static void
-dev_close (FpImageDevice *dev)
+dev_close (FpDevice *dev)
 {
   FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
   GUsbDevice *usb_dev = fpi_device_get_usb_device (FP_DEVICE (dev));
@@ -845,66 +431,11 @@ dev_close (FpImageDevice *dev)
   g_usb_device_release_interface (usb_dev, 0,
                                   G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER,
                                   NULL);
-  fpi_image_device_close_complete (dev, NULL);
-}
-
-/* ========================================================================
- * Activate / Deactivate / Change State
- * ======================================================================== */
-
-static void detect_start (FpImageDevice *dev);
-static void capture_start (FpImageDevice *dev);
-
-static void
-dev_activate (FpImageDevice *dev)
-{
-  fpi_image_device_activate_complete (dev, NULL);
-}
-
-static void
-dev_deactivate (FpImageDevice *dev)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-
-  if (self->poll_source)
-    {
-      g_source_destroy (self->poll_source);
-      g_source_unref (self->poll_source);
-      self->poll_source = NULL;
-    }
-
-  fpi_image_device_deactivate_complete (dev, NULL);
-}
-
-static void
-dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-
-  switch (state)
-    {
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
-      detect_start (dev);
-      break;
-
-    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
-      capture_start (dev);
-      break;
-
-    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
-      /* Press sensor — finger is already off after capture */
-      fpi_image_device_report_finger_status (dev, FALSE);
-      break;
-
-    default:
-      break;
-    }
-
-  (void) self;
+  fpi_device_close_complete (dev, NULL);
 }
 
 /* Forward declaration — defined below in capture section */
-static gboolean sync_readout_and_transfer (FpDevice *dev, GError **error);
+static gboolean sync_readout_and_transfer (int fd, guint8 *img, GError **error);
 
 /* ========================================================================
  * Finger Detection — Hardware SPI register 0x20 polling
@@ -1153,11 +684,8 @@ sync_reinit_sensor (FpiDeviceCanvasbio *self, GError **error)
 /* Synchronous: full capture cycle (scan → DA → readout → transfer).
  * Returns TRUE if image captured, FALSE on error. */
 static gboolean
-sync_full_capture (FpDevice *dev, GError **error)
+sync_full_capture (int fd, guint8 *img, GError **error)
 {
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  int fd = self->raw_usb_fd;
-
   /* Trigger scan */
   if (!sync_trigger_scan (fd, error))
     return FALSE;
@@ -1174,198 +702,18 @@ sync_full_capture (FpDevice *dev, GError **error)
     }
 
   /* Readout + image transfer */
-  if (!sync_readout_and_transfer (dev, error))
+  if (!sync_readout_and_transfer (fd, img, error))
     return FALSE;
 
   return TRUE;
 }
 
-/* Thread function: capture + variance-based finger detection.
- *
- * Hybrid strategy:
- * 1) Fast DA probe (scan-complete within short timeout) to skip expensive
- *    work when no finger is present.
- * 2) If probe indicates likely finger, capture full image and run variance
- *    check for robust confirmation.
- *
- * Returns TRUE (finger found, image in img_buf) or FALSE (no finger).
- */
-static void
-detect_thread_func (GTask *task, gpointer source_object,
-                    gpointer task_data, GCancellable *cancellable)
-{
-  FpDevice *dev = FP_DEVICE (source_object);
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  GError *error = NULL;
-
-  (void) task_data;
-
-  if (g_cancellable_is_cancelled (cancellable))
-    {
-      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Cancelled");
-      g_task_return_error (task, error);
-      return;
-    }
-
-  /* Fast path: if scan does not complete quickly, treat as no finger
-   * and avoid full image transfer + USB reset cycle. */
-  {
-    gboolean ready = FALSE;
-    guint probe_timeout_ms = cb_detect_fast_probe_timeout_ms ();
-    if (!sync_probe_scan_ready (self->raw_usb_fd, probe_timeout_ms, &ready, &error))
-      {
-        fp_warn ("Detect probe failed: %s", error->message);
-        g_clear_error (&error);
-        GError *re = NULL;
-        if (!sync_reinit_sensor (self, &re))
-          fp_warn ("Post-probe reinit: %s (non-fatal)", re->message);
-        g_clear_error (&re);
-        g_task_return_boolean (task, FALSE);
-        return;
-      }
-
-    if (!ready)
-      {
-        /* No finger: return quickly without full capture. */
-        g_task_return_boolean (task, FALSE);
-        return;
-      }
-  }
-
-  if (!sync_full_capture (dev, &error))
-    {
-      fp_warn ("Detect capture failed: %s", error->message);
-      g_clear_error (&error);
-      GError *re = NULL;
-      if (!sync_reinit_sensor (self, &re))
-        fp_warn ("Post-fail reinit: %s (non-fatal)", re->message);
-      g_clear_error (&re);
-      g_task_return_boolean (task, FALSE);
-      return;
-    }
-
-  /* Check image variance for finger presence */
-  {
-    gdouble sum = 0, sum_sq = 0;
-    gsize len = self->img_offset;
-    for (gsize i = 0; i < len; i++)
-      {
-        sum += self->img_buf[i];
-        sum_sq += (gdouble) self->img_buf[i] * self->img_buf[i];
-      }
-    gdouble mean = sum / len;
-    gdouble variance = (sum_sq / len) - (mean * mean);
-
-    fp_dbg ("Detect variance=%.1f (threshold=100)", variance);
-
-    if (variance > 100.0)
-      {
-        fp_dbg ("Finger detected!");
-        /* Reinit for next capture cycle */
-        GError *re = NULL;
-        if (!sync_reinit_sensor (self, &re))
-          fp_warn ("Post-capture reinit: %s (non-fatal)", re->message);
-        g_clear_error (&re);
-        g_task_return_boolean (task, TRUE);
-        return;
-      }
-  }
-
-  /* No finger — reinit for next attempt */
-  {
-    GError *re = NULL;
-    if (!sync_reinit_sensor (self, &re))
-      fp_warn ("No-finger reinit: %s (non-fatal)", re->message);
-    g_clear_error (&re);
-  }
-  g_task_return_boolean (task, FALSE);
-}
-
-/* Forward declarations */
-static gboolean detect_retry_cb (gpointer user_data);
-
-/* Completion callback: runs on main loop after detect thread finishes */
-static void
-detect_thread_done (GObject *source_object, GAsyncResult *res,
-                    gpointer user_data)
-{
-  FpDevice *dev = FP_DEVICE (source_object);
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
-  GError *error = NULL;
-  gboolean finger_found;
-
-  (void) user_data;
-
-  finger_found = g_task_propagate_boolean (G_TASK (res), &error);
-
-  if (error)
-    {
-      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        {
-          g_error_free (error);
-          return;
-        }
-      fp_warn ("Detect failed: %s", error->message);
-      fpi_image_device_session_error (img_dev, error);
-      return;
-    }
-
-  if (finger_found)
-    {
-      self->image_ready = TRUE;
-      fp_dbg ("Finger detected, image ready (%zd bytes)", self->img_offset);
-      fpi_image_device_report_finger_status (img_dev, TRUE);
-      return;
-    }
-
-  /* No finger — schedule retry quickly to improve responsiveness. */
-  g_timeout_add (cb_detect_retry_delay_ms (), detect_retry_cb, dev);
-}
-
-static gboolean
-detect_retry_cb (gpointer user_data)
-{
-  FpImageDevice *dev = FP_IMAGE_DEVICE (user_data);
-  detect_start (dev);
-  return G_SOURCE_REMOVE;
-}
-
-static void
-detect_start (FpImageDevice *dev)
-{
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-
-  self->image_ready = FALSE;
-
-  GCancellable *cancellable = NULL;
-  if (fpi_device_get_cancellable (FP_DEVICE (dev)))
-    cancellable = fpi_device_get_cancellable (FP_DEVICE (dev));
-
-  GTask *task = g_task_new (FP_DEVICE (dev), cancellable,
-                            detect_thread_done, NULL);
-  g_task_run_in_thread (task, detect_thread_func);
-  g_object_unref (task);
-}
-
-/* ========================================================================
- * Image Capture SSM (4 phases)
- * ======================================================================== */
-
-enum {
-  CAP_DO_EVERYTHING,
-  CAP_NUM_STATES,
-};
-
 /* Synchronous readout config + image transfer.
  * Must be done without async gaps — Cypress MCU is timing-sensitive.
  * Uses the persistent raw_usb_fd for all bulk transfers. */
 static gboolean
-sync_readout_and_transfer (FpDevice *dev, GError **error)
+sync_readout_and_transfer (int fd, guint8 *img, GError **error)
 {
-  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
-  int fd = self->raw_usb_fd;
-
   /* Readout config — matching Rust driver set_mode_readout() exactly */
   fp_dbg ("Readout config start");
 
@@ -1399,141 +747,508 @@ sync_readout_and_transfer (FpDevice *dev, GError **error)
   if (!sync_spi_write_reg2 (fd, 0x09, 0x0000, error)) return FALSE;
   fp_dbg ("Readout config done");
 
+  /* Drop anything still queued on bulk IN from an earlier, interrupted
+   * transfer; it would otherwise be read as the start of this image. */
+  {
+    guint8 junk[64];
+    int drained = 0;
+    for (int i = 0; i < 64; i++)
+      {
+        GError *derr = NULL;
+        int r = raw_bulk_in (fd, junk, sizeof (junk), 10, &derr);
+        g_clear_error (&derr);
+        if (r <= 0)
+          break;
+        drained += r;
+      }
+    if (drained)
+      fp_dbg ("Drained %d stale bytes before image read", drained);
+  }
+
   /* SPI prepare: read 10755 bytes (3B cmd + 10752B image) */
   guint16 total = IMG_SIZE + 3;
   if (!raw_ctrl_write (fd, CY_SPI_TRANSFER, SPI_DIR_READ, total, error))
     return FALSE;
 
-  /* Block 0: [A8 06 00] + 256 zeros = 259 bytes OUT, then read 256B IN */
-  guint8 block0[259] = { SPI_READ_CMD, 0x06, 0x00 };
-  memset (block0 + 3, 0, 256);
-
-  if (!raw_bulk_out (fd, block0, 259, error))
-    return FALSE;
-
+  /* The MCU returns one IN byte per OUT byte clocked over SPI: 3 bytes that
+   * echo the read command, then the 10752 pixels. Block 0 is 259 bytes; its
+   * last 3 bytes only arrive (as a short packet) after the next block is
+   * clocked, so a 256-byte read can return just those 3 and every later
+   * read lags one packet behind, leaving the image tail unread. The old
+   * code copied reads into fixed slots, which shifted rows sideways and
+   * dropped the tail. Waiting for a block's full count doesn't work either
+   * (the MCU holds the tail back, so the read times out). So: keep the
+   * per-block 256-byte reads the MCU expects, append whatever arrives in
+   * order, then collect the lagging tail with short reads. */
+  guint8 stream[3 + IMG_SIZE];
+  gsize got = 0;
+  guint8 out[259] = { SPI_READ_CMD, 0x06, 0x00 };  /* + 256 zeros */
   guint8 buf[256];
-  int ret = raw_bulk_in (fd, buf, 256, TIMEOUT_IMG, error);
-  if (ret < 0)
-    return FALSE;
 
-  gsize n = MIN ((gsize) ret, (gsize) IMG_SIZE);
-  memcpy (self->img_buf, buf, n);
-  self->img_offset = n;
-  fp_dbg ("Block 0: %d bytes", ret);
-
-  /* Blocks 1-41: 256 zeros OUT, read 256B IN */
-  guint8 zeros[256] = { 0 };
-  for (gint block = 1; block <= 41; block++)
+  for (gint block = 0; block < 42; block++)
     {
-      if (!raw_bulk_out (fd, zeros, 256, error))
+      if (!raw_bulk_out (fd, block == 0 ? out : out + 3,
+                         block == 0 ? 259 : 256, error))
         return FALSE;
 
-      ret = raw_bulk_in (fd, buf, 256, TIMEOUT_IMG, error);
-      if (ret < 0)
+      int r = raw_bulk_in (fd, buf, sizeof (buf), TIMEOUT_IMG, error);
+      if (r < 0)
         return FALSE;
-
-      gsize count = (gsize) ret;
-      gsize remaining = IMG_SIZE - self->img_offset;
-      gsize copy = MIN (count, remaining);
-      if (copy > 0)
-        {
-          memcpy (self->img_buf + self->img_offset, buf, copy);
-          self->img_offset += copy;
-        }
-
-      fp_dbg ("Block %d: %d bytes (total: %zd)", block, ret, self->img_offset);
+      gsize take = MIN ((gsize) r, sizeof (stream) - got);
+      memcpy (stream + got, buf, take);
+      got += take;
     }
 
-  fp_dbg ("Image transfer complete: %zd bytes", self->img_offset);
+  for (int tries = 0; got < sizeof (stream) && tries < 8; tries++)
+    {
+      GError *rerr = NULL;
+      int r = raw_bulk_in (fd, buf, sizeof (buf), 100, &rerr);
+      if (r <= 0)
+        {
+          g_clear_error (&rerr);
+          break;
+        }
+      gsize take = MIN ((gsize) r, sizeof (stream) - got);
+      memcpy (stream + got, buf, take);
+      got += take;
+    }
+
+  /* A handful of missing tail bytes is tolerable (padded below); a frame
+   * missing rows is not, since those rows would be fabricated. */
+  if (got < 3 + IMG_SIZE - IMG_WIDTH / 2)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Short image transfer: %zu of %d bytes", got, 3 + IMG_SIZE);
+      return FALSE;
+    }
+  if (got < sizeof (stream))
+    {
+      fp_dbg ("Image %zu bytes short, padding tail",
+              sizeof (stream) - got);
+      memset (stream + got, stream[got - 1], sizeof (stream) - got);
+    }
+
+  /* SPI reads come back shifted left one bit: each received byte holds the
+   * low 7 bits of the true byte plus the top bit of the next one (register
+   * reads show it too: HW ID 0x34 reads as 0x68, reg 0x60 = 0x1B as 0x36).
+   * Untreated, pixels >= 128 wrap and contrast doubles, which drew false
+   * edges inside every ridge. The lost top bit is the previous byte's LSB,
+   * so the shift is undone exactly. */
+  for (int i = 0; i < IMG_SIZE; i++)
+    img[i] = (stream[3 + i] >> 1) | ((stream[2 + i] & 1) << 7);
+  fp_dbg ("Image transfer complete: %zu bytes", got);
+  return TRUE;
+}
+
+/* ========================================================================
+ * Touch capture worker
+ *
+ * Runs on a GTask thread: optionally waits for the finger to lift, then for
+ * a touch; captures it and extracts match features. Sensor I/O is the same
+ * synchronous raw-usbdevfs path the rest of the driver uses.
+ * ======================================================================== */
+
+#define ENROLL_STAGES            12
+#define MATCH_THRESHOLD_DEFAULT  12   /* RANSAC inliers; impostors scored <= 6 */
+#define FINGER_MIN_STD           25.0 /* frame contrast below this = no finger */
+#define MAX_POLL_ERRORS          10
+
+typedef struct {
+  gboolean  wait_lift;
+  GBytes   *features;   /* out; NULL when the touch had too little detail */
+} TouchTask;
+
+static void
+touch_task_free (gpointer data)
+{
+  TouchTask *t = data;
+  g_clear_pointer (&t->features, g_bytes_unref);
+  g_free (t);
+}
+
+static gdouble
+img_std (const guint8 *img)
+{
+  gdouble s = 0, s2 = 0;
+  for (int i = 0; i < IMG_SIZE; i++)
+    {
+      s += img[i];
+      s2 += (gdouble) img[i] * img[i];
+    }
+  gdouble mean = s / IMG_SIZE;
+  return sqrt (MAX (0.0, s2 / IMG_SIZE - mean * mean));
+}
+
+/* Opt-in raw dump for building test sets (tools/cb-eval, cb-tool). */
+static void
+dump_raw (const guint8 *img)
+{
+  const gchar *dir = g_getenv ("CANVASBIO_DUMP_DIR");
+  static int count = 0;
+
+  if (!dir || !*dir)
+    return;
+  g_autofree gchar *path = g_strdup_printf ("%s/raw_%04d.pgm", dir, count++);
+  FILE *f = fopen (path, "wb");
+  if (!f)
+    return;
+  fprintf (f, "P5\n%d %d\n255\n", IMG_WIDTH, IMG_HEIGHT);
+  fwrite (img, 1, IMG_SIZE, f);
+  fclose (f);
+}
+
+/* One detection cycle: quick scan-complete probe, then a full frame if the
+ * probe fired. *captured says a frame was read; *present is TRUE only for a
+ * frame with ridge contrast. */
+static gboolean
+touch_poll (FpiDeviceCanvasbio *self, gboolean *captured, gboolean *present,
+            GError **error)
+{
+  gboolean ready = FALSE;
+
+  *captured = FALSE;
+  *present = FALSE;
+  if (!sync_probe_scan_ready (self->raw_usb_fd, cb_detect_fast_probe_timeout_ms (),
+                              &ready, error))
+    return FALSE;
+  if (!ready)
+    return TRUE;
+
+  gboolean ok = sync_full_capture (self->raw_usb_fd, self->img_buf, error);
+  GError *re = NULL;
+  if (!sync_reinit_sensor (self, &re))
+    {
+      if (ok)
+        {
+          g_propagate_error (error, re);
+          return FALSE;
+        }
+      g_clear_error (&re);
+    }
+  if (!ok)
+    return FALSE;
+
+  *captured = TRUE;
+  *present = img_std (self->img_buf) > FINGER_MIN_STD;
   return TRUE;
 }
 
 static void
-cap_run (FpiSsm *ssm, FpDevice *dev)
+touch_thread (GTask *task, gpointer source_object, gpointer task_data,
+              GCancellable *cancellable)
+{
+  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (source_object);
+  TouchTask *t = task_data;
+  gboolean want_present = !t->wait_lift;
+  int absent = 0, errors = 0;
+
+  for (;;)
+    {
+      GError *err = NULL;
+      gboolean captured, present;
+
+      if (g_cancellable_is_cancelled (cancellable))
+        {
+          g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                   "Cancelled");
+          return;
+        }
+
+      if (!touch_poll (self, &captured, &present, &err))
+        {
+          fp_warn ("Sensor poll failed: %s", err->message);
+          g_clear_error (&err);
+          /* Only a successful capture resets this, so a sensor that keeps
+           * failing reports an error instead of polling forever. */
+          if (++errors >= MAX_POLL_ERRORS)
+            {
+              g_task_return_error (task, fpi_device_error_new_msg (
+                                     FP_DEVICE_ERROR_GENERAL,
+                                     "Sensor stopped responding"));
+              return;
+            }
+          if (!sync_reinit_sensor (self, &err))
+            g_clear_error (&err);
+          continue;
+        }
+      if (captured)
+        errors = 0;
+
+      if (!want_present)
+        {
+          /* Two clear polls in a row before accepting the next touch. */
+          absent = present ? 0 : absent + 1;
+          if (absent >= 2)
+            want_present = TRUE;
+          else
+            g_usleep (cb_detect_retry_delay_ms () * 1000);
+          continue;
+        }
+      if (present)
+        break;
+      g_usleep (cb_detect_retry_delay_ms () * 1000);
+    }
+
+  dump_raw (self->img_buf);
+
+  int n_kp = 0;
+  t->features = cb_match_extract (self->img_buf, IMG_WIDTH, IMG_HEIGHT, &n_kp);
+  fp_dbg ("Touch captured: %d keypoints%s", n_kp,
+          t->features ? "" : " (too few, will retry)");
+  g_task_return_boolean (task, TRUE);
+}
+
+static void touch_done (GObject *source_object, GAsyncResult *res,
+                        gpointer user_data);
+
+static void
+touch_start (FpiDeviceCanvasbio *self, gboolean wait_lift)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  TouchTask *t = g_new0 (TouchTask, 1);
+
+  t->wait_lift = wait_lift;
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+
+  GTask *task = g_task_new (dev, fpi_device_get_cancellable (dev), touch_done, NULL);
+  g_task_set_task_data (task, t, touch_task_free);
+  g_task_run_in_thread (task, touch_thread);
+  g_object_unref (task);
+}
+
+/* ========================================================================
+ * Templates: enrolled prints hold the SIFT feature blobs of every enroll
+ * touch (no images), as GVariant "(qaay)" = (format version, blobs).
+ * ======================================================================== */
+
+#define TEMPLATE_VERSION 1
+
+static guint
+match_threshold (void)
+{
+  static gsize inited = 0;
+  static guint cached = MATCH_THRESHOLD_DEFAULT;
+
+  if (g_once_init_enter (&inited))
+    {
+      cached = cb_env_uint ("CANVASBIO_MATCH_THRESHOLD",
+                            MATCH_THRESHOLD_DEFAULT, 4, 200);
+      g_once_init_leave (&inited, 1);
+    }
+  return cached;
+}
+
+static GVariant *
+template_to_variant (GPtrArray *feats)
+{
+  GVariantBuilder b;
+
+  g_variant_builder_init (&b, G_VARIANT_TYPE ("aay"));
+  for (guint i = 0; i < feats->len; i++)
+    g_variant_builder_add_value (&b, g_variant_new_from_bytes (
+                                   G_VARIANT_TYPE_BYTESTRING,
+                                   g_ptr_array_index (feats, i), TRUE));
+  return g_variant_new ("(qaay)", (guint16) TEMPLATE_VERSION, &b);
+}
+
+/* Best score of a probe against every enroll touch of print, or -1 when
+ * the print isn't one of ours (e.g. enrolled by the old NBIS driver). */
+static int
+template_score (FpPrint *print, GBytes *probe)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GVariant) blobs = NULL;
+  guint16 version;
+  int best = 0;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(qaay)")))
+    return -1;
+  g_variant_get (data, "(q@aay)", &version, &blobs);
+  if (version != TEMPLATE_VERSION)
+    return -1;
+
+  for (gsize i = 0; i < g_variant_n_children (blobs); i++)
+    {
+      g_autoptr(GVariant) child = g_variant_get_child_value (blobs, i);
+      g_autoptr(GBytes) tmpl = g_variant_get_data_as_bytes (child);
+      best = MAX (best, cb_match_score (tmpl, probe));
+    }
+  return best;
+}
+
+/* ========================================================================
+ * Enroll / Verify / Identify
+ * ======================================================================== */
+
+static void
+action_fail (FpDevice *dev, GError *error)
 {
   FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
 
-  switch (fpi_ssm_get_cur_state (ssm))
+  g_ptr_array_set_size (self->enroll_feats, 0);
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+  switch (fpi_device_get_current_action (dev))
     {
-    case CAP_DO_EVERYTHING:
-      {
-        FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
+    case FPI_DEVICE_ACTION_ENROLL:
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+    case FPI_DEVICE_ACTION_VERIFY:
+      fpi_device_verify_complete (dev, error);
+      break;
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      fpi_device_identify_complete (dev, error);
+      break;
+    default:
+      fpi_device_action_error (dev, error);
+    }
+}
 
-        if (!self->image_ready)
-          {
-            /* Image should have been captured in detect phase.
-             * If not, something went wrong — retry detect. */
-            fp_warn ("No pre-captured image available!");
-            GError *err = g_error_new_literal (G_IO_ERROR,
-                                                G_IO_ERROR_FAILED,
-                                                "No image captured");
-            fpi_ssm_mark_failed (ssm, err);
-            break;
-          }
+static void
+enroll_touch (FpiDeviceCanvasbio *self, GBytes *features)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
 
-        /* Process and submit the pre-captured image */
-        gsize copy_len = MIN (self->img_offset, (gsize) IMG_SIZE);
+  if (!features)
+    {
+      fpi_device_enroll_progress (dev, self->enroll_feats->len, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      touch_start (self, TRUE);
+      return;
+    }
 
-        fp_dbg ("Submitting pre-captured image: %zd bytes", copy_len);
+  g_ptr_array_add (self->enroll_feats, g_bytes_ref (features));
+  fpi_device_enroll_progress (dev, self->enroll_feats->len, NULL, NULL);
+  if (self->enroll_feats->len < ENROLL_STAGES)
+    {
+      touch_start (self, TRUE);
+      return;
+    }
 
-        /* CLAHE enhancement on raw image */
-        cb_clahe (self->img_buf, IMG_WIDTH, IMG_HEIGHT, 8, 8, 2.5);
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+  g_object_set (print, "fpi-data", template_to_variant (self->enroll_feats), NULL);
+  g_ptr_array_set_size (self->enroll_feats, 0);
 
-#ifdef CB_DEBUG_IMAGES
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+static void
+verify_touch (FpiDeviceCanvasbio *self, GBytes *features)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  FpPrint *print = NULL;
+
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+  if (!features)
+    {
+      fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      fpi_device_verify_complete (dev, NULL);
+      return;
+    }
+
+  fpi_device_get_verify_data (dev, &print);
+  int score = template_score (print, features);
+  fp_dbg ("Verify score %d (threshold %u)", score, match_threshold ());
+  if (score < 0)
+    {
+      fpi_device_verify_complete (dev, fpi_device_error_new_msg (
+                                    FP_DEVICE_ERROR_DATA_INVALID,
+                                    "Print enrolled by an older driver version; please re-enroll"));
+      return;
+    }
+  fpi_device_verify_report (dev, score >= (int) match_threshold () ?
+                            FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, NULL, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+
+static void
+identify_touch (FpiDeviceCanvasbio *self, GBytes *features)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  GPtrArray *prints = NULL;
+  FpPrint *best = NULL;
+  int best_score = -1;
+
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+  if (!features)
+    {
+      fpi_device_identify_report (dev, NULL, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      fpi_device_identify_complete (dev, NULL);
+      return;
+    }
+
+  fpi_device_get_identify_data (dev, &prints);
+  for (guint i = 0; i < prints->len; i++)
+    {
+      FpPrint *p = g_ptr_array_index (prints, i);
+      int s = template_score (p, features);
+      if (s > best_score)
         {
-          static int dump_count = 0;
-          char path[256];
-          snprintf (path, sizeof (path), "/tmp/canvasbio_%03d.pgm", dump_count++);
-          FILE *f = fopen (path, "wb");
-          if (f)
-            {
-              fprintf (f, "P5\n%d %d\n255\n", IMG_WIDTH, IMG_HEIGHT);
-              fwrite (self->img_buf, 1, copy_len, f);
-              fclose (f);
-              fp_dbg ("Dumped image to %s", path);
-            }
+          best_score = s;
+          best = p;
         }
-#endif
-
-        /* 3x bicubic upscale: 112x96 → 336x288 */
-        #define UPSCALE 3
-        int dw = IMG_WIDTH * UPSCALE;
-        int dh = IMG_HEIGHT * UPSCALE;
-
-        FpImage *img = fp_image_new (dw, dh);
-        img->ppmm = 19.685;
-        img->flags = FPI_IMAGE_COLORS_INVERTED;
-
-        cb_bicubic_upscale (self->img_buf, IMG_WIDTH, IMG_HEIGHT,
-                            img->data, UPSCALE);
-
-        fp_dbg ("Submitting image: %dx%d, ppmm=%.2f, flags=0x%x",
-                img->width, img->height, img->ppmm, img->flags);
-
-        self->image_ready = FALSE;
-        fpi_image_device_image_captured (img_dev, img);
-        fpi_image_device_report_finger_status (img_dev, FALSE);
-        break;
-      }
     }
+  fp_dbg ("Identify best score %d (threshold %u)", best_score, match_threshold ());
+  fpi_device_identify_report (dev, best_score >= (int) match_threshold () ? best : NULL,
+                              NULL, NULL);
+  fpi_device_identify_complete (dev, NULL);
 }
 
 static void
-cap_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+touch_done (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
-  if (error)
+  FpDevice *dev = FP_DEVICE (source_object);
+  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
+  TouchTask *t = g_task_get_task_data (G_TASK (res));
+  GError *error = NULL;
+
+  if (!g_task_propagate_boolean (G_TASK (res), &error))
     {
-      FpImageDevice *img_dev = FP_IMAGE_DEVICE (dev);
-      fpi_image_device_session_error (img_dev, error);
+      action_fail (dev, error);
+      return;
+    }
+  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
+
+  switch (fpi_device_get_current_action (dev))
+    {
+    case FPI_DEVICE_ACTION_ENROLL:
+      enroll_touch (self, t->features);
+      break;
+    case FPI_DEVICE_ACTION_VERIFY:
+      verify_touch (self, t->features);
+      break;
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      identify_touch (self, t->features);
+      break;
+    default:
+      g_assert_not_reached ();
     }
 }
 
 static void
-capture_start (FpImageDevice *dev)
+dev_enroll (FpDevice *dev)
 {
-  /* Image was already captured in detect phase — just submit it */
-  FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), cap_run, CAP_NUM_STATES);
-  fpi_ssm_start (ssm, cap_done);
+  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (dev);
+
+  g_ptr_array_set_size (self->enroll_feats, 0);
+  touch_start (self, FALSE);
+}
+
+static void
+dev_verify (FpDevice *dev)
+{
+  touch_start (FPI_DEVICE_CANVASBIO (dev), FALSE);
+}
+
+static void
+dev_identify (FpDevice *dev)
+{
+  touch_start (FPI_DEVICE_CANVASBIO (dev), FALSE);
 }
 
 /* ========================================================================
@@ -1541,35 +1256,44 @@ capture_start (FpImageDevice *dev)
  * ======================================================================== */
 
 static void
+fpi_device_canvasbio_finalize (GObject *object)
+{
+  FpiDeviceCanvasbio *self = FPI_DEVICE_CANVASBIO (object);
+
+  g_clear_pointer (&self->enroll_feats, g_ptr_array_unref);
+  G_OBJECT_CLASS (fpi_device_canvasbio_parent_class)->finalize (object);
+}
+
+static void
 fpi_device_canvasbio_init (FpiDeviceCanvasbio *self)
 {
   self->initialized = FALSE;
-  self->poll_source = NULL;
   self->raw_usb_fd = -1;
+  self->enroll_feats = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
 }
 
 static void
 fpi_device_canvasbio_class_init (FpiDeviceCanvasbioClass *klass)
 {
+  GObjectClass *obj_class = G_OBJECT_CLASS (klass);
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
+
+  obj_class->finalize = fpi_device_canvasbio_finalize;
 
   dev_class->id = "canvasbio";
   dev_class->full_name = "CanvasBio CB2000 Fingerprint Sensor";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  dev_class->nr_enroll_stages = 5;
+  dev_class->nr_enroll_stages = ENROLL_STAGES;
 
-  img_class->img_width = IMG_WIDTH;
-  img_class->img_height = IMG_HEIGHT;
-  img_class->bz3_threshold = 6;
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
+  dev_class->enroll = dev_enroll;
+  dev_class->verify = dev_verify;
+  dev_class->identify = dev_identify;
 
-  img_class->img_open = dev_open;
-  img_class->img_close = dev_close;
-  img_class->activate = dev_activate;
-  img_class->deactivate = dev_deactivate;
-  img_class->change_state = dev_change_state;
+  fpi_device_class_auto_initialize_features (dev_class);
 }
 
 /* TOD entry point — libfprint loads this symbol from the .so */
