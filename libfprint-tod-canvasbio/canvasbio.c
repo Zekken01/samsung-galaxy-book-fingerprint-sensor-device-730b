@@ -879,24 +879,6 @@ img_std (const guint8 *img)
   return sqrt (MAX (0.0, s2 / IMG_SIZE - mean * mean));
 }
 
-/* Opt-in raw dump for building test sets (tools/cb-eval, cb-tool). */
-static void
-dump_raw (const guint8 *img)
-{
-  const gchar *dir = g_getenv ("CANVASBIO_DUMP_DIR");
-  static int count = 0;
-
-  if (!dir || !*dir)
-    return;
-  g_autofree gchar *path = g_strdup_printf ("%s/raw_%04d.pgm", dir, count++);
-  FILE *f = fopen (path, "wb");
-  if (!f)
-    return;
-  fprintf (f, "P5\n%d %d\n255\n", IMG_WIDTH, IMG_HEIGHT);
-  fwrite (img, 1, IMG_SIZE, f);
-  fclose (f);
-}
-
 /* One detection cycle: quick scan-complete probe, then a full frame if the
  * probe fired. *captured says a frame was read; *present is TRUE only for a
  * frame with ridge contrast. */
@@ -988,8 +970,6 @@ touch_thread (GTask *task, gpointer source_object, gpointer task_data,
         break;
       g_usleep (cb_detect_retry_delay_ms () * 1000);
     }
-
-  dump_raw (self->img_buf);
 
   int n_kp = 0;
   t->features = cb_match_extract (self->img_buf, IMG_WIDTH, IMG_HEIGHT, &n_kp);

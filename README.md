@@ -39,17 +39,6 @@ inliers (0 accepted of 120), genuine probes a median of 33-43.
 **Prints enrolled with the old driver must be re-enrolled**
 (`fprintd-delete $USER`, then `fprintd-enroll`).
 
-Development tools in `tools/` (build with `tools/build.sh`):
-
-- `cb-tool snap|sweep|capture`: talk to the sensor directly (no fprintd) to
-  grab raw frames or labelled datasets.
-- `cb-match-eval <dir> [stages] [threshold]`: genuine/impostor scores of the
-  driver's matcher on a dataset of `<finger>_<n>.pgm` files.
-- `cb-eval <dir>`: the same for libfprint's NBIS path, at several scales.
-
-Set `CANVASBIO_DUMP_DIR=/some/dir` in fprintd's environment to save each
-captured raw frame for building such datasets.
-
 ## Quick Start
 
 ### 1) Build CLI
